@@ -5,8 +5,10 @@ from api_client import APIClient
 import config
 import exporter
 import re
+import hmac
 from collections import defaultdict
 import io
+import os
 import database
 
 
@@ -16,6 +18,56 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+def get_login_secret(name):
+    """Read login credentials from Streamlit secrets or environment variables."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, "")
+
+
+def require_login():
+    """Stop the app until the user has signed in."""
+    if st.session_state.get("authenticated"):
+        with st.sidebar:
+            st.caption(f"Signed in as {st.session_state.get('username', '')}")
+            if st.button("Logout", use_container_width=True):
+                st.session_state.authenticated = False
+                st.session_state.username = ""
+                st.rerun()
+        return
+
+    expected_username = get_login_secret("APP_USERNAME")
+    expected_password = get_login_secret("APP_PASSWORD")
+
+    st.title("Vehicle Data Extractor")
+    st.subheader("Login")
+
+    if not expected_username or not expected_password:
+        st.error("Login credentials are not configured.")
+        st.info("Add APP_USERNAME and APP_PASSWORD in Streamlit Secrets.")
+        st.stop()
+
+    with st.form("login_form"):
+        username = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+
+    if submitted:
+        username_ok = hmac.compare_digest(username.strip(), expected_username)
+        password_ok = hmac.compare_digest(password, expected_password)
+        if username_ok and password_ok:
+            st.session_state.authenticated = True
+            st.session_state.username = username.strip()
+            st.rerun()
+        else:
+            st.error("Invalid email or password.")
+
+    st.stop()
+
+
+require_login()
 
 # Initialize database
 database.init_database()

@@ -4,6 +4,7 @@ Stores base URLs, headers, and authentication cookies.
 """
 
 import os
+import time
 from typing import Dict, Optional
 
 # Base API URL
@@ -22,6 +23,18 @@ DEFAULT_HEADERS = {
 # API Endpoints
 MODELS_ENDPOINT = f"{BASE_URL}/connect/api/vehicle/models/categorized"
 ENGINES_ENDPOINT = f"{BASE_URL}/connect/api/vehicle/engines"
+MODEL_LOCALE = "en_US"
+
+
+def get_model_request_params(brand_code: str) -> Dict[str, str]:
+    """Return the same model-list params used by the website UI."""
+    cache_buster = str(int(time.time() * 1000))
+    return {
+        "nocache": cache_buster,
+        "locale": MODEL_LOCALE,
+        "brandCode": brand_code,
+        "_": cache_buster,
+    }
 
 # Brand codes for API - ALL brands (current, legacy, international)
 BRAND_CODES = {
@@ -44,6 +57,36 @@ BRAND_CODES = {
     'PLYMOUTH': 'PLYMOUTH',
     'VOLKSWAGEN': 'VW',
 }
+
+# Some API model names differ from the public website name in specific markets.
+# Keep these mappings keyed by API brand code so they only affect the right brand.
+MODEL_NAME_ALIASES = {
+    ('CITROEN', 'JUMPER'): 'RELAY',
+    ('CITROEN', 'JUMPY'): 'DISPATCH',
+    ('CITROEN', 'JUMPY COMBI'): 'DISPATCH COMBI',
+}
+
+
+def get_model_display_name(brand_code: str, model_name: str) -> str:
+    """Return the website-facing model name for an API model name."""
+    if not model_name:
+        return model_name
+
+    alias_key = (brand_code.upper(), model_name.strip().upper())
+    return MODEL_NAME_ALIASES.get(alias_key, model_name)
+
+
+def get_version_display_name(brand_code: str, source_model_name: str, version_name: str) -> str:
+    """Return version name with market-facing model names."""
+    if not version_name:
+        return version_name
+
+    display_model_name = get_model_display_name(brand_code, source_model_name)
+    if not source_model_name or display_model_name == source_model_name:
+        return version_name
+
+    return version_name.replace(source_model_name, display_model_name)
+
 
 # Request delays and retries
 REQUEST_DELAY = 0.3  # seconds between requests

@@ -10,6 +10,7 @@ from pathlib import Path
 import streamlit as st
 from api_client import APIClient
 import config
+import parser
 
 # Database file path
 DB_PATH = Path(__file__).parent / "vehicle_data.db"
@@ -41,6 +42,7 @@ def init_database():
             model_id INTEGER PRIMARY KEY,
             brand_id INTEGER NOT NULL,
             model_name TEXT NOT NULL,
+            api_model_name TEXT,
             FOREIGN KEY(brand_id) REFERENCES brands(brand_id)
         )
     ''')
@@ -60,9 +62,20 @@ def init_database():
             engine_id INTEGER PRIMARY KEY,
             version_id INTEGER NOT NULL,
             engine_name TEXT NOT NULL,
+            engine_status TEXT DEFAULT 'OK',
             FOREIGN KEY(version_id) REFERENCES versions(version_id)
         )
     ''')
+
+    c.execute("PRAGMA table_info(models)")
+    model_columns = {row[1] for row in c.fetchall()}
+    if "api_model_name" not in model_columns:
+        c.execute("ALTER TABLE models ADD COLUMN api_model_name TEXT")
+
+    c.execute("PRAGMA table_info(engines)")
+    engine_columns = {row[1] for row in c.fetchall()}
+    if "engine_status" not in engine_columns:
+        c.execute("ALTER TABLE engines ADD COLUMN engine_status TEXT DEFAULT 'OK'")
     
     conn.commit()
     conn.close()
@@ -96,6 +109,7 @@ def regenerate_database():
     try:
         with APIClient(config.get_cookies()) as client:
             brand_items = list(config.BRAND_CODES.items())
+            engine_issue_count = 0
             
             for idx, (brand_name, brand_code) in enumerate(brand_items):
                 try:
@@ -117,31 +131,34 @@ def regenerate_database():
                     # Fetch models
                     response = client.get(
                         config.MODELS_ENDPOINT,
-                        params={"brandCode": brand_code}
+                        params=config.get_model_request_params(brand_code)
                     )
                     
-                    categories = response.get('categories', [])
-                    models = []
-                    for category in categories:
-                        models.extend(category.get('models', []))
+                    models = parser.extract_models(response)
                     
                     # Insert models and their versions/engines
                     for model in models:
-                        model_name = model.get('modelName', '')
+                        api_model_name = parser.get_model_name(model)
+                        model_name = config.get_model_display_name(brand_code, api_model_name)
                         
                         c.execute(
-                            "INSERT INTO models (brand_id, model_name) VALUES (?, ?)",
-                            (brand_id, model_name)
+                            "INSERT INTO models (brand_id, model_name, api_model_name) VALUES (?, ?, ?)",
+                            (brand_id, model_name, api_model_name)
                         )
                         conn.commit()
                         
                         c.execute("SELECT last_insert_rowid()")
                         model_id = c.fetchone()[0]
                         
-                        versions = model.get('modelVersions', [])
+                        versions = parser.extract_versions(model)
                         for version in versions:
-                            version_id_api = version.get('modelVersionId', '')
-                            version_name = version.get('versionName', 'Unknown')
+                            version_id_api = parser.get_version_id(version)
+                            api_version_name = parser.get_version_name(version)
+                            version_name = config.get_version_display_name(
+                                brand_code,
+                                api_model_name,
+                                api_version_name
+                            )
                             
                             c.execute(
                                 "INSERT INTO versions (model_id, version_name, version_id_api) VALUES (?, ?, ?)",
@@ -158,18 +175,25 @@ def regenerate_database():
                                     config.ENGINES_ENDPOINT,
                                     params={"modelVersionId": version_id_api}
                                 )
-                                engines = engine_response.get('engines', [])
-                                
-                                for engine in engines:
-                                    engine_name = engine.get('engine', '')
-                                    if engine_name:
-                                        c.execute(
-                                            "INSERT INTO engines (version_id, engine_name) VALUES (?, ?)",
-                                            (version_id, engine_name)
-                                        )
+                                engine_names = parser.extract_engine_names(engine_response)
+                                engine_status = 'OK' if engine_names else 'EMPTY_RESPONSE'
+                                if not engine_names:
+                                    engine_issue_count += 1
+                                    engine_names = ['N/A']
+
+                                for engine_name in engine_names:
+                                    c.execute(
+                                        "INSERT INTO engines (version_id, engine_name, engine_status) VALUES (?, ?, ?)",
+                                        (version_id, engine_name, engine_status)
+                                    )
                                 conn.commit()
-                            except:
-                                pass
+                            except Exception as e:
+                                engine_issue_count += 1
+                                c.execute(
+                                    "INSERT INTO engines (version_id, engine_name, engine_status) VALUES (?, ?, ?)",
+                                    (version_id, 'N/A', f'FETCH_FAILED: {e}')
+                                )
+                                conn.commit()
                 
                 except Exception as e:
                     if '401' in str(e):
@@ -188,7 +212,10 @@ def regenerate_database():
         progress_bar.empty()
         status_text.empty()
         conn.close()
-        return True, "Database regenerated successfully!"
+        message = "Database regenerated successfully!"
+        if engine_issue_count:
+            message += f" {engine_issue_count} versions did not return a real engine; check the model tree/export status."
+        return True, message
     
     except Exception as e:
         conn.close()
@@ -196,7 +223,7 @@ def regenerate_database():
 
 
 def search_models(query):
-    """Search for models by name, returns list of matches."""
+    """Search for models by display, source, or version name."""
     if not DB_PATH.exists():
         return []
     
@@ -206,12 +233,15 @@ def search_models(query):
     query_pattern = f"%{query}%"
     
     c.execute("""
-        SELECT DISTINCT m.model_name 
-        FROM models m 
-        WHERE m.model_name LIKE ? 
+        SELECT DISTINCT m.model_name
+        FROM models m
+        LEFT JOIN versions v ON v.model_id = m.model_id
+        WHERE m.model_name LIKE ?
+           OR COALESCE(m.api_model_name, '') LIKE ?
+           OR COALESCE(v.version_name, '') LIKE ?
         ORDER BY m.model_name
         LIMIT 50
-    """, (query_pattern,))
+    """, (query_pattern, query_pattern, query_pattern))
     
     results = [row[0] for row in c.fetchall()]
     conn.close()
@@ -228,16 +258,32 @@ def search_models_and_engines(query):
     
     query_pattern = f"%{query}%"
     
-    # Search models
+    # Search models and version-level names. A website "model" may be stored as
+    # a version under a broader API model, e.g. C3 PICASSO under C3.
     c.execute("""
-        SELECT DISTINCT m.model_name 
-        FROM models m 
-        WHERE m.model_name LIKE ? 
-        ORDER BY m.model_name
+        SELECT DISTINCT
+            CASE
+                WHEN v.version_name LIKE ? AND v.version_name <> m.model_name THEN v.version_name
+                ELSE m.model_name
+            END AS label,
+            m.model_name,
+            CASE
+                WHEN v.version_name LIKE ? AND v.version_name <> m.model_name THEN v.version_name
+                ELSE NULL
+            END AS version_name
+        FROM models m
+        LEFT JOIN versions v ON v.model_id = m.model_id
+        WHERE m.model_name LIKE ?
+           OR COALESCE(m.api_model_name, '') LIKE ?
+           OR COALESCE(v.version_name, '') LIKE ?
+        ORDER BY label
         LIMIT 50
-    """, (query_pattern,))
+    """, (query_pattern, query_pattern, query_pattern, query_pattern, query_pattern))
     
-    models = [row[0] for row in c.fetchall()]
+    models = [
+        {'label': row[0], 'model': row[1], 'version': row[2]}
+        for row in c.fetchall()
+    ]
     
     # Search engines
     c.execute("""
@@ -246,7 +292,8 @@ def search_models_and_engines(query):
         JOIN versions v ON e.version_id = v.version_id
         JOIN models m ON v.model_id = m.model_id
         JOIN brands b ON m.brand_id = b.brand_id
-        WHERE e.engine_name LIKE ? 
+        WHERE e.engine_name LIKE ?
+          AND COALESCE(e.engine_status, 'OK') = 'OK'
         ORDER BY e.engine_name
         LIMIT 50
     """, (query_pattern,))
@@ -257,7 +304,7 @@ def search_models_and_engines(query):
     return {'models': models, 'engines': engines}
 
 
-def get_tree_structure(brand_name=None, model_name=None):
+def get_tree_structure(brand_name=None, model_name=None, version_name=None):
     """Get tree structure of Brand → Model → Version → Engine."""
     if not DB_PATH.exists():
         return {}
@@ -269,11 +316,12 @@ def get_tree_structure(brand_name=None, model_name=None):
     
     # Build query
     query = """
-        SELECT b.brand_name, m.model_name, v.version_name, e.engine_name
-        FROM engines e
-        JOIN versions v ON e.version_id = v.version_id
-        JOIN models m ON v.model_id = m.model_id
-        JOIN brands b ON m.brand_id = b.brand_id
+        SELECT b.brand_name, m.model_name, COALESCE(v.version_name, 'Unknown'),
+               COALESCE(e.engine_name, 'N/A')
+        FROM brands b
+        JOIN models m ON m.brand_id = b.brand_id
+        LEFT JOIN versions v ON v.model_id = m.model_id
+        LEFT JOIN engines e ON e.version_id = v.version_id
         WHERE 1=1
     """
     params = []
@@ -285,6 +333,10 @@ def get_tree_structure(brand_name=None, model_name=None):
     if model_name:
         query += " AND m.model_name = ?"
         params.append(model_name)
+
+    if version_name:
+        query += " AND v.version_name = ?"
+        params.append(version_name)
     
     query += " ORDER BY b.brand_name, m.model_name, v.version_name, e.engine_name"
     

@@ -10,6 +10,10 @@ from collections import defaultdict
 import io
 import os
 import database
+import parser
+
+
+EXTRACTION_STATE_VERSION = "locale-en-us-model-names-v2"
 
 
 # Page configuration
@@ -79,7 +83,7 @@ def check_cookies_valid():
         with APIClient(config.get_cookies()) as client:
             response = client.get(
                 config.MODELS_ENDPOINT,
-                params={"brandCode": "JEEP"}
+                params=config.get_model_request_params("JEEP")
             )
             return response.get('categories') is not None
     except:
@@ -151,7 +155,7 @@ with st.sidebar:
                         with APIClient(config.get_cookies()) as client:
                             response = client.get(
                                 config.MODELS_ENDPOINT,
-                                params={"brandCode": "JEEP"}
+                                params=config.get_model_request_params("JEEP")
                             )
                             if response.get('categories'):
                                 st.success("Connection successful! ✅")
@@ -232,6 +236,28 @@ if 'cookies_updated' not in st.session_state:
     st.session_state.cookies_updated = False
 if 'search_results' not in st.session_state:
     st.session_state.search_results = None
+if st.session_state.get('extraction_state_version') != EXTRACTION_STATE_VERSION:
+    st.session_state.extracted_data = None
+    st.session_state.extraction_complete = False
+    st.session_state.extraction_state_version = EXTRACTION_STATE_VERSION
+if (
+    st.session_state.extracted_data is not None
+    and list(st.session_state.extracted_data.columns) != ['Brand', 'Model', 'Version', 'Engines']
+):
+    st.session_state.extracted_data = None
+    st.session_state.extraction_complete = False
+    st.session_state.extraction_state_version = EXTRACTION_STATE_VERSION
+
+
+def get_model_result_parts(model_result):
+    """Support both legacy string results and richer search result dictionaries."""
+    if isinstance(model_result, dict):
+        return (
+            model_result.get('label') or model_result.get('model') or '',
+            model_result.get('model') or model_result.get('label') or '',
+            model_result.get('version')
+        )
+    return model_result, model_result, None
 
 
 def render_tree(tree_data, max_depth=0, current_depth=0):
@@ -296,11 +322,10 @@ def get_all_brands():
                     # Fetch models for this specific brand using brandCode parameter
                     response = client.get(
                         config.MODELS_ENDPOINT,
-                        params={"brandCode": brand_code}
+                        params=config.get_model_request_params(brand_code)
                     )
                     
-                    categories = response.get('categories', [])
-                    models_count = sum(len(cat.get('models', [])) for cat in categories)
+                    models_count = len(parser.extract_models(response))
                     
                     if models_count > 0:
                         brands_dict[brand_name] = models_count
@@ -340,14 +365,11 @@ def extract_brand_data(brand_name):
             print(f"Fetching {brand_name} (code: {brand_code})...")
             response = client.get(
                 config.MODELS_ENDPOINT,
-                params={"brandCode": brand_code}
+                params=config.get_model_request_params(brand_code)
             )
             
-            # Get all models from response
-            categories = response.get('categories', [])
-            models = []
-            for category in categories:
-                models.extend(category.get('models', []))
+            # Get all models from response. Some brands use a different nesting shape.
+            models = parser.extract_models(response)
             
             if not models:
                 return None, f"No models found for {brand_name}"
@@ -362,13 +384,19 @@ def extract_brand_data(brand_name):
                 progress_bar.progress(progress)
                 status_text.text(f"Processing: {idx + 1}/{len(models)} models...")
                 
-                model_name = model.get('modelName', '')
-                versions = model.get('modelVersions', [])
+                api_model_name = parser.get_model_name(model)
+                model_name = config.get_model_display_name(brand_code, api_model_name)
+                versions = parser.extract_versions(model)
                 
                 # Process each version
                 for version in versions:
-                    version_id = version.get('modelVersionId', '')
-                    version_name = version.get('versionName', 'Unknown')
+                    version_id = parser.get_version_id(version)
+                    api_version_name = parser.get_version_name(version)
+                    version_name = config.get_version_display_name(
+                        brand_code,
+                        api_model_name,
+                        api_version_name
+                    )
                     
                     # Get engines for this version
                     try:
@@ -376,9 +404,8 @@ def extract_brand_data(brand_name):
                             config.ENGINES_ENDPOINT,
                             params={"modelVersionId": version_id}
                         )
-                        engines = engine_response.get('engines', [])
-                        engine_list = [e.get('engine', '') for e in engines if e.get('engine')]
-                    except:
+                        engine_list = parser.extract_engine_names(engine_response)
+                    except Exception:
                         engine_list = []
                     
                     if not engine_list:
@@ -430,9 +457,10 @@ else:
                 # Display model results first
                 if results['models']:
                     st.markdown(f"**Models ({model_count}):**")
-                    for model in results['models']:
-                        if st.button(f"{model}", key=f"model_{model}", use_container_width=True):
-                            tree_data = database.get_tree_structure(model_name=model)
+                    for model_result in results['models']:
+                        model_label, model_name, version_name = get_model_result_parts(model_result)
+                        if st.button(f"{model_label}", key=f"model_{model_label}_{model_name}_{version_name}", use_container_width=True):
+                            tree_data = database.get_tree_structure(model_name=model_name, version_name=version_name)
                             if tree_data:
                                 st.divider()
                                 render_tree(tree_data)
@@ -475,9 +503,10 @@ else:
                 # Then display model results
                 if results['models']:
                     st.markdown(f"**Models ({model_count}):**")
-                    for model in results['models']:
-                        if st.button(f"{model}", key=f"model_{model}", use_container_width=True):
-                            tree_data = database.get_tree_structure(model_name=model)
+                    for model_result in results['models']:
+                        model_label, model_name, version_name = get_model_result_parts(model_result)
+                        if st.button(f"{model_label}", key=f"model_{model_label}_{model_name}_{version_name}", use_container_width=True):
+                            tree_data = database.get_tree_structure(model_name=model_name, version_name=version_name)
                             if tree_data:
                                 st.divider()
                                 render_tree(tree_data)

@@ -11,6 +11,7 @@ import io
 import os
 import database
 import parser
+import torque_verifier
 
 
 EXTRACTION_STATE_VERSION = "locale-en-us-model-names-v2"
@@ -649,6 +650,133 @@ if st.session_state.extraction_complete and st.session_state.extracted_data is n
         st.bar_chart(engine_counts)
 else:
     st.info("Extract data from a brand above to see results here.")
+
+st.divider()
+
+st.markdown("### Torque Verification Search")
+
+with st.form("torque_verification_form"):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        torque_year = st.number_input(
+            "Model year",
+            min_value=1900,
+            max_value=2100,
+            value=2026,
+            step=1,
+            key="torque_verify_year"
+        )
+    with col2:
+        torque_vehicle_family = st.text_input(
+            "VEH FAM",
+            placeholder="e.g., JL, WL, DJ, LB, DT",
+            key="torque_verify_vehicle_family"
+        )
+    with col3:
+        torque_engine_code = st.text_input(
+            "Engine code",
+            placeholder="e.g., ERC, EJN, EZH",
+            key="torque_verify_engine_code"
+        )
+
+    torque_vsc_name = st.text_input(
+        "VSC name",
+        placeholder="e.g., Brakes, Suspension / Control Arms & Track Bar",
+        key="torque_verify_vsc_name"
+    )
+    torque_description = st.text_input(
+        "Description",
+        placeholder="e.g., Master Cylinder Nuts",
+        key="torque_verify_description"
+    )
+    torque_target = st.text_input(
+        "Target torque specification",
+        placeholder="e.g., 18 N·m, 0030, 25 N·m",
+        key="torque_verify_target"
+    )
+
+    torque_submitted = st.form_submit_button("Verify torque", use_container_width=True)
+
+if torque_submitted:
+    missing_fields = []
+    if not torque_vehicle_family.strip():
+        missing_fields.append("VEH FAM")
+    if not torque_engine_code.strip():
+        missing_fields.append("Engine code")
+    if not torque_description.strip():
+        missing_fields.append("Description")
+    if not torque_target.strip():
+        missing_fields.append("Target torque specification")
+
+    if missing_fields:
+        st.error(f"Enter: {', '.join(missing_fields)}")
+    else:
+        with st.spinner("Checking Service Library torque specifications..."):
+            try:
+                verification = torque_verifier.verify_torque(
+                    int(torque_year),
+                    torque_vehicle_family,
+                    torque_engine_code,
+                    torque_vsc_name,
+                    torque_description,
+                    torque_target,
+                )
+            except Exception as exc:
+                st.error(f"Torque verification failed: {exc}")
+                verification = None
+
+        if verification:
+            st.markdown("#### Verification Result")
+            result_rows = [
+                {"Field": "Vehicle", "Match": "Yes" if verification["vehicle_match"] else "No"},
+                {"Field": "Engine code", "Match": "Yes" if verification["engine_match"] else "No"},
+                {"Field": "VSC name", "Match": "Yes" if verification["vsc_match"] else "No"},
+                {"Field": "Description", "Match": "Yes" if verification["description_match"] else "No"},
+                {"Field": "Torque", "Match": "Yes" if verification["torque_match"] else "No"},
+            ]
+            st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
+
+            if verification.get("vehicle"):
+                vehicle = verification["vehicle"]
+                st.markdown(
+                    f"**Vehicle:** {vehicle['brand']} {vehicle['model']} "
+                    f"({vehicle['version']} {vehicle['model_code']})"
+                )
+            if verification.get("engine"):
+                engine = verification["engine"]
+                st.markdown(f"**Engine:** {engine['engine_code']} - {engine['engine']}")
+
+            best = verification.get("best")
+            if best:
+                st.markdown("#### Best Match")
+                st.markdown(f"**Page:** {best['page']}")
+                st.markdown(f"**Found description:** {best['description']}")
+                st.markdown(f"**Found specification:** {best['specification']}")
+                if best.get("comment"):
+                    st.markdown(f"**Comment:** {best['comment']}")
+
+                candidates = verification.get("candidates", [])
+                if len(candidates) > 1:
+                    with st.expander("Other candidate matches"):
+                        candidate_rows = [
+                            {
+                                "Page": candidate["page"],
+                                "Description": candidate["description"],
+                                "Specification": candidate["specification"],
+                                "Description Score": round(candidate["description_score"], 2),
+                                "Torque Match": "Yes" if candidate["torque_match"] else "No",
+                            }
+                            for candidate in candidates[1:]
+                        ]
+                        st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info(verification.get("message", "No matching torque rows found."))
+
+            if verification.get("torque_pages_found") is not None:
+                st.caption(
+                    f"Checked {verification['torque_pages_checked']} of "
+                    f"{verification['torque_pages_found']} torque pages."
+                )
 
 st.divider()
 

@@ -22,6 +22,11 @@ ENGINE_NAME_FIELDS = (
     "motor",
     "powertrain",
 )
+ENGINE_CODE_FIELDS = (
+    "salesCode",
+    "engineCode",
+    "code",
+)
 
 
 def _walk(value: Any) -> Iterable[Any]:
@@ -96,6 +101,11 @@ def get_version_name(version: Dict[str, Any]) -> str:
 
 def extract_engine_names(response: Dict[str, Any]) -> List[str]:
     """Find engine names in a response without assuming a single JSON shape."""
+    return [engine["name"] for engine in extract_engines(response)]
+
+
+def extract_engines(response: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Find engine names and sales codes without assuming a single JSON shape."""
     names = []
     seen = set()
 
@@ -105,7 +115,9 @@ def extract_engine_names(response: Dict[str, Any]) -> List[str]:
                 value = item.get(field)
                 if isinstance(value, str) and value.strip():
                     normalized = value.strip()
-                    if normalized not in seen:
-                        seen.add(normalized)
-                        names.append(normalized)
+                    code = _first_text(item, ENGINE_CODE_FIELDS)
+                    marker = (normalized, code)
+                    if marker not in seen:
+                        seen.add(marker)
+                        names.append({"name": normalized, "code": code})
     return names

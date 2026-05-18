@@ -260,6 +260,15 @@ def get_model_result_parts(model_result):
     return model_result, model_result, None
 
 
+def format_engine_result(engine_result):
+    """Return a readable engine label with the sales code when available."""
+    engine = engine_result['engine']
+    engine_code = engine_result.get('engine_code')
+    if engine_code:
+        return f"{engine_code} - {engine}"
+    return engine
+
+
 def render_tree(tree_data, max_depth=0, current_depth=0):
     """Render tree structure with indentation: Brand → Model → Version → Engine."""
     if current_depth == 0:
@@ -472,7 +481,7 @@ else:
                 if results['engines']:
                     st.markdown(f"**Engines ({engine_count}):**")
                     for eng_result in results['engines']:
-                        engine = eng_result['engine']
+                        engine = format_engine_result(eng_result)
                         model = eng_result['model']
                         brand = eng_result['brand']
                         if st.button(f"{engine} ({brand} {model})", key=f"engine_{engine}_{model}_{brand}", use_container_width=True):
@@ -488,7 +497,7 @@ else:
                 if results['engines']:
                     st.markdown(f"**Engines ({engine_count}):**")
                     for eng_result in results['engines']:
-                        engine = eng_result['engine']
+                        engine = format_engine_result(eng_result)
                         model = eng_result['model']
                         brand = eng_result['brand']
                         if st.button(f"{engine} ({brand} {model})", key=f"engine_{engine}_{model}_{brand}", use_container_width=True):

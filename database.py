@@ -62,6 +62,7 @@ def init_database():
             engine_id INTEGER PRIMARY KEY,
             version_id INTEGER NOT NULL,
             engine_name TEXT NOT NULL,
+            engine_code TEXT,
             engine_status TEXT DEFAULT 'OK',
             FOREIGN KEY(version_id) REFERENCES versions(version_id)
         )
@@ -74,6 +75,8 @@ def init_database():
 
     c.execute("PRAGMA table_info(engines)")
     engine_columns = {row[1] for row in c.fetchall()}
+    if "engine_code" not in engine_columns:
+        c.execute("ALTER TABLE engines ADD COLUMN engine_code TEXT")
     if "engine_status" not in engine_columns:
         c.execute("ALTER TABLE engines ADD COLUMN engine_status TEXT DEFAULT 'OK'")
     
@@ -175,23 +178,28 @@ def regenerate_database():
                                     config.ENGINES_ENDPOINT,
                                     params={"modelVersionId": version_id_api}
                                 )
-                                engine_names = parser.extract_engine_names(engine_response)
-                                engine_status = 'OK' if engine_names else 'EMPTY_RESPONSE'
-                                if not engine_names:
+                                engine_items = parser.extract_engines(engine_response)
+                                engine_status = 'OK' if engine_items else 'EMPTY_RESPONSE'
+                                if not engine_items:
                                     engine_issue_count += 1
-                                    engine_names = ['N/A']
+                                    engine_items = [{'name': 'N/A', 'code': ''}]
 
-                                for engine_name in engine_names:
+                                for engine_item in engine_items:
                                     c.execute(
-                                        "INSERT INTO engines (version_id, engine_name, engine_status) VALUES (?, ?, ?)",
-                                        (version_id, engine_name, engine_status)
+                                        "INSERT INTO engines (version_id, engine_name, engine_code, engine_status) VALUES (?, ?, ?, ?)",
+                                        (
+                                            version_id,
+                                            engine_item['name'],
+                                            engine_item.get('code', ''),
+                                            engine_status
+                                        )
                                     )
                                 conn.commit()
                             except Exception as e:
                                 engine_issue_count += 1
                                 c.execute(
-                                    "INSERT INTO engines (version_id, engine_name, engine_status) VALUES (?, ?, ?)",
-                                    (version_id, 'N/A', f'FETCH_FAILED: {e}')
+                                    "INSERT INTO engines (version_id, engine_name, engine_code, engine_status) VALUES (?, ?, ?, ?)",
+                                    (version_id, 'N/A', '', f'FETCH_FAILED: {e}')
                                 )
                                 conn.commit()
                 
@@ -287,18 +295,21 @@ def search_models_and_engines(query):
     
     # Search engines
     c.execute("""
-        SELECT DISTINCT e.engine_name, m.model_name, b.brand_name
+        SELECT DISTINCT e.engine_name, COALESCE(e.engine_code, ''), m.model_name, b.brand_name
         FROM engines e
         JOIN versions v ON e.version_id = v.version_id
         JOIN models m ON v.model_id = m.model_id
         JOIN brands b ON m.brand_id = b.brand_id
-        WHERE e.engine_name LIKE ?
+        WHERE (e.engine_name LIKE ? OR COALESCE(e.engine_code, '') LIKE ?)
           AND COALESCE(e.engine_status, 'OK') = 'OK'
-        ORDER BY e.engine_name
+        ORDER BY COALESCE(e.engine_code, ''), e.engine_name
         LIMIT 50
-    """, (query_pattern,))
+    """, (query_pattern, query_pattern))
     
-    engines = [{'engine': row[0], 'model': row[1], 'brand': row[2]} for row in c.fetchall()]
+    engines = [
+        {'engine': row[0], 'engine_code': row[1], 'model': row[2], 'brand': row[3]}
+        for row in c.fetchall()
+    ]
     
     conn.close()
     return {'models': models, 'engines': engines}
@@ -317,7 +328,7 @@ def get_tree_structure(brand_name=None, model_name=None, version_name=None):
     # Build query
     query = """
         SELECT b.brand_name, m.model_name, COALESCE(v.version_name, 'Unknown'),
-               COALESCE(e.engine_name, 'N/A')
+               COALESCE(e.engine_name, 'N/A'), COALESCE(e.engine_code, '')
         FROM brands b
         JOIN models m ON m.brand_id = b.brand_id
         LEFT JOIN versions v ON v.model_id = m.model_id
@@ -344,14 +355,15 @@ def get_tree_structure(brand_name=None, model_name=None, version_name=None):
     rows = c.fetchall()
     
     # Build tree structure
-    for brand, model, version, engine in rows:
+    for brand, model, version, engine, engine_code in rows:
+        engine_label = f"{engine_code} - {engine}" if engine_code else engine
         if brand not in tree:
             tree[brand] = {}
         if model not in tree[brand]:
             tree[brand][model] = {}
         if version not in tree[brand][model]:
             tree[brand][model][version] = []
-        tree[brand][model][version].append(engine)
+        tree[brand][model][version].append(engine_label)
     
     conn.close()
     return tree

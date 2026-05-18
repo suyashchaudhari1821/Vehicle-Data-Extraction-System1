@@ -3,8 +3,9 @@ Database management for caching vehicle model data
 Provides fast searching and tree structure generation
 """
 
+import os
 import sqlite3
-import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
 import streamlit as st
@@ -13,14 +14,18 @@ import config
 import parser
 
 # Database file path
-DB_PATH = Path(__file__).parent / "vehicle_data.db"
+DB_PATH = Path(os.environ.get("VEHICLE_DB_PATH", Path(__file__).parent / "vehicle_data.db"))
 
 
-def init_database():
-    """Initialize the database schema."""
-    conn = sqlite3.connect(DB_PATH)
+def _connect(db_path=DB_PATH):
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(db_path)
+
+
+def _create_schema(conn):
+    """Create or migrate the database schema on an open connection."""
     c = conn.cursor()
-    
+
     # Create tables
     c.execute('''
         CREATE TABLE IF NOT EXISTS metadata (
@@ -81,12 +86,18 @@ def init_database():
         c.execute("ALTER TABLE engines ADD COLUMN engine_status TEXT DEFAULT 'OK'")
     
     conn.commit()
+
+
+def init_database(db_path=DB_PATH):
+    """Initialize the database schema."""
+    conn = _connect(db_path)
+    _create_schema(conn)
     conn.close()
 
 
 def get_last_refresh_time():
     """Get the last time the database was refreshed."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("SELECT value FROM metadata WHERE key='last_refresh'")
     result = c.fetchone()
@@ -94,26 +105,69 @@ def get_last_refresh_time():
     return result[0] if result else "Never"
 
 
+def get_database_summary():
+    """Return basic database details for diagnostics in the UI."""
+    summary = {
+        "path": str(DB_PATH),
+        "exists": DB_PATH.exists(),
+        "size_bytes": DB_PATH.stat().st_size if DB_PATH.exists() else 0,
+        "last_refresh": "Never",
+        "brands": 0,
+        "models": 0,
+        "versions": 0,
+        "engines": 0,
+    }
+
+    if not DB_PATH.exists():
+        return summary
+
+    try:
+        conn = _connect()
+        _create_schema(conn)
+        c = conn.cursor()
+        c.execute("SELECT value FROM metadata WHERE key='last_refresh'")
+        result = c.fetchone()
+        summary["last_refresh"] = result[0] if result else "Never"
+
+        for table in ("brands", "models", "versions", "engines"):
+            c.execute(f"SELECT COUNT(*) FROM {table}")
+            summary[table] = c.fetchone()[0]
+
+        conn.close()
+    except Exception:
+        return summary
+
+    return summary
+
+
 def regenerate_database():
-    """Regenerate the entire database from the API."""
-    init_database()
-    conn = sqlite3.connect(DB_PATH)
+    """Regenerate the entire database from the API and atomically replace it."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix=f"{DB_PATH.stem}_",
+        suffix=".tmp",
+        dir=DB_PATH.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+
+    conn = _connect(temp_path)
+    _create_schema(conn)
     c = conn.cursor()
-    
-    # Clear existing data
-    c.execute("DELETE FROM engines")
-    c.execute("DELETE FROM versions")
-    c.execute("DELETE FROM models")
-    c.execute("DELETE FROM brands")
-    
+
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     try:
         with APIClient(config.get_cookies()) as client:
             brand_items = list(config.BRAND_CODES.items())
             engine_issue_count = 0
-            
+            skipped_brands = []
+            model_count = 0
+            version_count = 0
+            engine_count = 0
+
             for idx, (brand_name, brand_code) in enumerate(brand_items):
                 try:
                     progress = (idx + 1) / len(brand_items)
@@ -138,6 +192,9 @@ def regenerate_database():
                     )
                     
                     models = parser.extract_models(response)
+                    if not models:
+                        skipped_brands.append(f"{brand_name}: no models returned")
+                        continue
                     
                     # Insert models and their versions/engines
                     for model in models:
@@ -149,6 +206,7 @@ def regenerate_database():
                             (brand_id, model_name, api_model_name)
                         )
                         conn.commit()
+                        model_count += 1
                         
                         c.execute("SELECT last_insert_rowid()")
                         model_id = c.fetchone()[0]
@@ -168,6 +226,7 @@ def regenerate_database():
                                 (model_id, version_name, version_id_api)
                             )
                             conn.commit()
+                            version_count += 1
                             
                             c.execute("SELECT last_insert_rowid()")
                             version_id = c.fetchone()[0]
@@ -194,6 +253,7 @@ def regenerate_database():
                                             engine_status
                                         )
                                     )
+                                    engine_count += 1
                                 conn.commit()
                             except Exception as e:
                                 engine_issue_count += 1
@@ -201,32 +261,57 @@ def regenerate_database():
                                     "INSERT INTO engines (version_id, engine_name, engine_code, engine_status) VALUES (?, ?, ?, ?)",
                                     (version_id, 'N/A', '', f'FETCH_FAILED: {e}')
                                 )
+                                engine_count += 1
                                 conn.commit()
                 
                 except Exception as e:
                     if '401' in str(e):
                         progress_bar.empty()
                         status_text.empty()
+                        conn.close()
+                        temp_path.unlink(missing_ok=True)
                         return False, "Cookies expired! Please update them in Settings."
-                    pass
-        
+                    skipped_brands.append(f"{brand_name}: {e}")
+
+            if model_count == 0 or version_count == 0:
+                progress_bar.empty()
+                status_text.empty()
+                conn.close()
+                temp_path.unlink(missing_ok=True)
+                reason = "; ".join(skipped_brands[:3]) if skipped_brands else "No data returned from API"
+                return False, f"Database was not replaced because the API returned no usable model data. {reason}"
+
         # Update refresh time
         c.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             ('last_refresh', str(datetime.now()))
         )
+        c.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            ('last_refresh_summary', f"{model_count} models, {version_count} versions, {engine_count} engines")
+        )
         conn.commit()
-        
+
         progress_bar.empty()
         status_text.empty()
         conn.close()
-        message = "Database regenerated successfully!"
+
+        os.replace(temp_path, DB_PATH)
+
+        message = f"Database regenerated successfully: {model_count} models, {version_count} versions, {engine_count} engines."
         if engine_issue_count:
             message += f" {engine_issue_count} versions did not return a real engine; check the model tree/export status."
+        if skipped_brands:
+            message += f" Skipped {len(skipped_brands)} brand(s): {'; '.join(skipped_brands[:3])}"
         return True, message
     
     except Exception as e:
-        conn.close()
+        progress_bar.empty()
+        status_text.empty()
+        try:
+            conn.close()
+        finally:
+            temp_path.unlink(missing_ok=True)
         return False, str(e)
 
 
@@ -235,7 +320,7 @@ def search_models(query):
     if not DB_PATH.exists():
         return []
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     
     query_pattern = f"%{query}%"
@@ -261,7 +346,7 @@ def search_models_and_engines(query):
     if not DB_PATH.exists():
         return {'models': [], 'engines': []}
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     
     query_pattern = f"%{query}%"
@@ -320,7 +405,7 @@ def get_tree_structure(brand_name=None, model_name=None, version_name=None):
     if not DB_PATH.exists():
         return {}
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     
     tree = {}
@@ -375,7 +460,7 @@ def is_database_exists():
         return False
     
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM brands")
         count = c.fetchone()[0]

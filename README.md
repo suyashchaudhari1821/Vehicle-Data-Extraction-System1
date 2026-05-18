@@ -86,6 +86,25 @@ This will:
 - Open the application in your default browser
 - Display a beautified UI for data extraction
 
+## Persistent Database on Streamlit Cloud
+
+Streamlit Cloud resets files written at runtime when the app restarts. To keep
+the refreshed `vehicle_data.db` after restart, configure GitHub DB sync in
+Streamlit Secrets:
+
+```toml
+GITHUB_DB_SYNC_ENABLED = "true"
+GITHUB_TOKEN = "github_pat_your_token_here"
+GITHUB_REPO = "suyashchaudhari1821/Vehicle-Data-Extraction-System1"
+GITHUB_BRANCH = "main"
+GITHUB_DB_PATH = "vehicle_data.db"
+```
+
+Use a GitHub fine-grained personal access token with **Contents: Read and
+write** access to this repository. After this is configured, the app downloads
+the latest database from GitHub on startup and uploads the database back to
+GitHub after every successful **Build/Refresh Database**.
+
 ### Option 2: Run Batch Scripts
 
 Extract data for all brands:

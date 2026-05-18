@@ -9,7 +9,9 @@ import hmac
 from collections import defaultdict
 import io
 import os
+from pathlib import Path
 import database
+import db_sync
 import parser
 import torque_verifier
 
@@ -73,6 +75,15 @@ def require_login():
 
 
 require_login()
+
+# Pull the latest persisted DB before initializing the schema. This keeps
+# Streamlit restarts from falling back to the old bundled SQLite file.
+if not st.session_state.get("db_sync_startup_checked"):
+    sync_result = db_sync.download_database_if_newer(database.DB_PATH)
+    st.session_state.db_sync_startup_checked = True
+    st.session_state.db_sync_status = sync_result.message
+    if sync_result.changed:
+        st.cache_data.clear()
 
 # Initialize database
 database.init_database()
@@ -172,8 +183,27 @@ with st.sidebar:
     
     db_exists = database.is_database_exists()
     if db_exists:
-        last_refresh = database.get_last_refresh_time()
-        st.info(f"Last updated: {last_refresh}")
+        db_summary = database.get_database_summary()
+        st.info(f"Last updated: {db_summary['last_refresh']}")
+        st.caption(
+            f"Loaded {db_summary['models']} models, "
+            f"{db_summary['versions']} versions, "
+            f"{db_summary['engines']} engines"
+        )
+        if db_sync.is_configured():
+            st.caption(f"GitHub DB sync: {st.session_state.get('db_sync_status', 'enabled')}")
+        else:
+            st.caption("GitHub DB sync is not configured; restart will use the deployed DB file.")
+        db_file = Path(db_summary["path"])
+        if db_file.exists():
+            st.download_button(
+                "Download Current Database",
+                data=db_file.read_bytes(),
+                file_name="vehicle_data.db",
+                mime="application/vnd.sqlite3",
+                use_container_width=True,
+                help="Optional backup copy of the SQLite database currently loaded by the app.",
+            )
     else:
         st.warning("Database is empty. Build it first!")
     
@@ -184,7 +214,14 @@ with st.sidebar:
             with st.spinner("Building database from API..."):
                 success, message = database.regenerate_database()
                 if success:
+                    sync_result = db_sync.upload_database(database.DB_PATH)
+                    st.session_state.db_sync_status = sync_result.message
                     st.success(message)
+                    if sync_result.ok:
+                        st.success(sync_result.message)
+                    else:
+                        st.warning(sync_result.message)
+                    st.cache_data.clear()
                     st.rerun()
                 else:
                     st.error(f"Failed: {message}")
@@ -537,6 +574,7 @@ with col1:
 
 with col2:
     if st.button("Refresh Brands", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
 
 # Fetch and display brands

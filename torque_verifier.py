@@ -186,10 +186,14 @@ def _extract_engine_options(response: Dict[str, Any]) -> List[Dict[str, str]]:
     return engines
 
 
-def _find_engine(vehicle: Dict[str, Any], engine_code: str) -> Optional[Dict[str, str]]:
+def _get_engine_options(vehicle: Dict[str, Any]) -> List[Dict[str, str]]:
     response = _get_json("/connect/api/vehicle/engines", params={"modelVersionId": vehicle["model_version_id"]})
+    return _extract_engine_options(response)
+
+
+def _find_engine(vehicle: Dict[str, Any], engine_code: str) -> Optional[Dict[str, str]]:
     wanted_code = _compact_code(engine_code)
-    for engine in _extract_engine_options(response):
+    for engine in _get_engine_options(vehicle):
         if _compact_code(engine["engine_code"]) == wanted_code:
             return engine
     return None
@@ -284,6 +288,65 @@ def _extract_torque_rows(content_html: str, leaf: Dict[str, str]) -> List[Dict[s
     return rows
 
 
+def _score_torque_row(
+    row: Dict[str, Any],
+    leaf: Dict[str, Any],
+    description: str,
+    target_torque: str,
+) -> Dict[str, Any]:
+    description_score = _text_score(description, row["description"]) if description.strip() else 0.0
+    torque_matches = _torque_match(target_torque, row["specification"])
+    torque_score = 1.0 if torque_matches else _text_score(target_torque, row["specification"])
+    vsc_score = float(leaf.get("vsc_score", 0.0))
+
+    if description.strip():
+        score = (0.58 * description_score) + (0.30 * torque_score) + (0.12 * vsc_score)
+    else:
+        score = (0.78 * torque_score) + (0.22 * vsc_score)
+
+    enriched = row.copy()
+    enriched["vsc_score"] = vsc_score
+    enriched["description_score"] = description_score
+    enriched["torque_score"] = torque_score
+    enriched["torque_match"] = torque_matches
+    enriched["score"] = score
+    enriched["confidence"] = round(score * 100, 1)
+    return enriched
+
+
+def _build_engine_targets(
+    vehicles: List[Dict[str, Any]],
+    engine_code: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    targets = []
+    checked_engines = []
+    wanted_code = _compact_code(engine_code)
+    seen = set()
+
+    for vehicle in vehicles:
+        engines = _get_engine_options(vehicle)
+        matched_engines = []
+        for engine in engines:
+            if wanted_code and _compact_code(engine["engine_code"]) != wanted_code:
+                continue
+            marker = (vehicle["model_version_id"], engine.get("model_version_engine_id"))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            matched_engines.append(engine)
+            targets.append({"vehicle": vehicle, "engine": engine})
+
+        checked_engines.append(
+            {
+                "vehicle": vehicle,
+                "engine_found": bool(matched_engines),
+                "engine_count": len(engines),
+            }
+        )
+
+    return targets, checked_engines
+
+
 def verify_torque(
     model_year: int,
     vehicle_family: str,
@@ -305,94 +368,138 @@ def verify_torque(
             "candidates": [],
         }
 
-    checked_engines = []
-    selected_vehicle = None
-    selected_engine = None
-    for vehicle in vehicles:
-        engine = _find_engine(vehicle, engine_code)
-        checked_engines.append({"vehicle": vehicle, "engine_found": bool(engine)})
-        if engine:
-            selected_vehicle = vehicle
-            selected_engine = engine
-            break
+    engine_code_was_provided = bool(engine_code.strip())
+    engine_targets, checked_engines = _build_engine_targets(vehicles, engine_code)
 
-    if not selected_vehicle or not selected_engine:
+    if not engine_targets:
         return {
             "vehicle_match": True,
             "engine_match": False,
             "vsc_match": False,
             "description_match": False,
             "torque_match": False,
-            "message": "Vehicle found, but engine code was not found for that vehicle.",
+            "status": "Needs review",
+            "confidence": 0,
+            "message": "Vehicle found, but the engine code was not found for that vehicle.",
             "vehicles": vehicles,
             "checked_engines": checked_engines,
             "candidates": [],
         }
 
-    service_book = _get_service_book(selected_engine["model_version_engine_id"])
-    if not service_book:
+    all_candidates = []
+    selected_vehicle = engine_targets[0]["vehicle"]
+    selected_engine = engine_targets[0]["engine"]
+    pages_found = 0
+    pages_checked = 0
+    engine_books_checked = 0
+    missing_books = 0
+
+    for target in engine_targets:
+        vehicle = target["vehicle"]
+        engine = target["engine"]
+        service_book = _get_service_book(engine["model_version_engine_id"])
+        if not service_book:
+            missing_books += 1
+            continue
+
+        engine_books_checked += 1
+        toc = _get_json(
+            f"/connect/api/toc/{service_book['modelVersionBookId']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}",
+            params={"locale": config.MODEL_LOCALE, "nocache": str(int(time.time() * 1000))},
+        )
+        leaves = _rank_leaves(_collect_torque_leaves(toc), vsc_name)
+        pages_found = max(pages_found, len(leaves))
+        if not leaves:
+            continue
+
+        # VSC name is a ranking hint. Search the best pages first, but keep enough
+        # breadth for cases where Excel wording differs from Service Library TOC.
+        strong_vsc_leaves = [leaf for leaf in leaves if leaf["vsc_score"] >= 0.35]
+        if vsc_name.strip():
+            leaves_to_check = strong_vsc_leaves[:12] if strong_vsc_leaves else leaves[:25]
+        else:
+            leaves_to_check = leaves[:35]
+
+        for leaf in leaves_to_check:
+            pages_checked += 1
+            html = _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
+            for row in _extract_torque_rows(html, leaf):
+                candidate = _score_torque_row(row, leaf, description, target_torque)
+                candidate["vehicle"] = vehicle
+                candidate["engine"] = engine
+                candidate["engine_code_provided"] = engine_code_was_provided
+                all_candidates.append(candidate)
+
+        if engine_code_was_provided and any(
+            row["description_score"] >= 0.95 and row["torque_match"]
+            for row in all_candidates
+        ):
+            break
+
+    if not engine_books_checked:
         return {
             "vehicle_match": True,
-            "engine_match": True,
+            "engine_match": bool(engine_targets),
             "vsc_match": False,
             "description_match": False,
             "torque_match": False,
+            "status": "Needs review",
+            "confidence": 0,
             "message": "Vehicle and engine found, but Service Information book was not available.",
             "vehicle": selected_vehicle,
             "engine": selected_engine,
+            "engines_checked": len(engine_targets),
+            "missing_books": missing_books,
             "candidates": [],
         }
 
-    toc = _get_json(
-        f"/connect/api/toc/{service_book['modelVersionBookId']}/{CONFIG_LEVEL}/{selected_engine['model_version_engine_id']}",
-        params={"locale": config.MODEL_LOCALE, "nocache": str(int(time.time() * 1000))},
-    )
-    leaves = _rank_leaves(_collect_torque_leaves(toc), vsc_name)
-    if not leaves:
+    candidates = sorted(all_candidates, key=lambda row: row["score"], reverse=True)[:5]
+    best = candidates[0] if candidates else None
+    if not best:
         return {
             "vehicle_match": True,
-            "engine_match": True,
+            "engine_match": engine_code_was_provided,
             "vsc_match": False,
             "description_match": False,
             "torque_match": False,
-            "message": "No torque specification pages were found.",
+            "status": "Not found",
+            "confidence": 0,
+            "message": "No matching torque rows were found.",
             "vehicle": selected_vehicle,
             "engine": selected_engine,
+            "engines_checked": len(engine_targets),
             "candidates": [],
+            "torque_pages_checked": pages_checked,
+            "torque_pages_found": pages_found,
         }
 
-    rows = []
-    # VSC name is a ranking hint. Search the best pages first, but keep enough
-    # breadth for cases where Excel wording differs from Service Library TOC.
-    strong_vsc_leaves = [leaf for leaf in leaves if leaf["vsc_score"] >= 0.35]
-    leaves_to_check = strong_vsc_leaves[:12] if strong_vsc_leaves else leaves[:25]
+    description_match = bool(description.strip() and best["description_score"] >= 0.65)
+    torque_match = bool(best["torque_match"])
+    if torque_match and description_match and (engine_code_was_provided or len(engine_targets) == 1):
+        status = "Verified"
+    elif torque_match and (description_match or not description.strip()):
+        status = "Probable match"
+    elif best["confidence"] >= 55:
+        status = "Needs review"
+    else:
+        status = "Not found"
 
-    checked_pages = 0
-    for leaf in leaves_to_check:
-        checked_pages += 1
-        html = _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
-        for row in _extract_torque_rows(html, leaf):
-            row["vsc_score"] = leaf["vsc_score"]
-            row["description_score"] = _text_score(description, row["description"])
-            row["torque_match"] = _torque_match(target_torque, row["specification"])
-            row["score"] = row["description_score"] + (0.35 if row["torque_match"] else 0) + (0.15 * leaf["vsc_score"])
-            rows.append(row)
-        if any(row["description_score"] >= 0.95 and row["torque_match"] for row in rows):
-            break
-
-    candidates = sorted(rows, key=lambda row: row["score"], reverse=True)[:10]
-    best = candidates[0] if candidates else None
     return {
         "vehicle_match": True,
-        "engine_match": True,
-        "vsc_match": bool(leaves and leaves[0]["vsc_score"] >= 0.35),
-        "description_match": bool(best and best["description_score"] >= 0.72),
-        "torque_match": bool(best and best["torque_match"]),
+        "engine_match": engine_code_was_provided and bool(engine_targets),
+        "engine_code_provided": engine_code_was_provided,
+        "vsc_match": bool(vsc_name.strip() and best["vsc_score"] >= 0.35),
+        "description_match": description_match,
+        "torque_match": torque_match,
+        "status": status,
+        "confidence": best["confidence"],
         "message": "Verification completed.",
-        "vehicle": selected_vehicle,
-        "engine": selected_engine,
+        "vehicle": best["vehicle"],
+        "engine": best["engine"],
+        "engines_checked": len(engine_targets),
+        "missing_books": missing_books,
         "best": best,
         "candidates": candidates,
-        "torque_pages_checked": checked_pages,
-        "torque_pages_found": len(leaves),
+        "torque_pages_checked": pages_checked,
+        "torque_pages_found": pages_found,
     }

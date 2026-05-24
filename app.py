@@ -16,7 +16,8 @@ import parser
 import torque_verifier
 
 
-EXTRACTION_STATE_VERSION = "locale-en-us-model-names-v2"
+EXPORT_COLUMNS = ['Brand', 'Model', 'Version', 'Engine Code', 'Engines']
+EXTRACTION_STATE_VERSION = "engine-code-column-v1"
 
 
 # Page configuration
@@ -204,6 +205,18 @@ with st.sidebar:
                 use_container_width=True,
                 help="Optional backup copy of the SQLite database currently loaded by the app.",
             )
+            if db_sync.is_configured():
+                if st.button(
+                    "Save Current Database to GitHub",
+                    use_container_width=True,
+                    help="Replace the GitHub-stored SQLite database with the current loaded database.",
+                ):
+                    sync_result = db_sync.upload_database(database.DB_PATH)
+                    st.session_state.db_sync_status = sync_result.message
+                    if sync_result.ok:
+                        st.success(sync_result.message)
+                    else:
+                        st.warning(sync_result.message)
     else:
         st.warning("Database is empty. Build it first!")
     
@@ -280,7 +293,7 @@ if st.session_state.get('extraction_state_version') != EXTRACTION_STATE_VERSION:
     st.session_state.extraction_state_version = EXTRACTION_STATE_VERSION
 if (
     st.session_state.extracted_data is not None
-    and list(st.session_state.extracted_data.columns) != ['Brand', 'Model', 'Version', 'Engines']
+    and list(st.session_state.extracted_data.columns) != EXPORT_COLUMNS
 ):
     st.session_state.extracted_data = None
     st.session_state.extraction_complete = False
@@ -451,12 +464,12 @@ def extract_brand_data(brand_name):
                             config.ENGINES_ENDPOINT,
                             params={"modelVersionId": version_id}
                         )
-                        engine_list = parser.extract_engine_names(engine_response)
+                        engine_list = parser.extract_engines(engine_response)
                     except Exception:
                         engine_list = []
                     
                     if not engine_list:
-                        engine_list = ['N/A']
+                        engine_list = [{'name': 'N/A', 'code': ''}]
                     
                     # Create a separate row for each engine (vertical stacking)
                     for engine in engine_list:
@@ -464,13 +477,14 @@ def extract_brand_data(brand_name):
                             'Brand': brand_name,
                             'Model': model_name,
                             'Version': version_name,
-                            'Engines': engine
+                            'Engine Code': engine.get('code', ''),
+                            'Engines': engine.get('name', 'N/A')
                         })
             
             progress_bar.empty()
             status_text.empty()
             
-            return pd.DataFrame(flattened_data), None
+            return pd.DataFrame(flattened_data, columns=EXPORT_COLUMNS), None
     
     except Exception as e:
         return None, str(e)
@@ -739,10 +753,6 @@ if torque_submitted:
     missing_fields = []
     if not torque_vehicle_family.strip():
         missing_fields.append("VEH FAM")
-    if not torque_engine_code.strip():
-        missing_fields.append("Engine code")
-    if not torque_description.strip():
-        missing_fields.append("Description")
     if not torque_target.strip():
         missing_fields.append("Target torque specification")
 
@@ -765,11 +775,33 @@ if torque_submitted:
 
         if verification:
             st.markdown("#### Verification Result")
+            st.metric("Status", verification.get("status", "Unknown"), f"{verification.get('confidence', 0)}% confidence")
             result_rows = [
                 {"Field": "Vehicle", "Match": "Yes" if verification["vehicle_match"] else "No"},
-                {"Field": "Engine code", "Match": "Yes" if verification["engine_match"] else "No"},
-                {"Field": "VSC name", "Match": "Yes" if verification["vsc_match"] else "No"},
-                {"Field": "Description", "Match": "Yes" if verification["description_match"] else "No"},
+                {
+                    "Field": "Engine code",
+                    "Match": (
+                        "Yes"
+                        if verification["engine_match"]
+                        else "Searched all engines"
+                        if not verification.get("engine_code_provided")
+                        else "No"
+                    ),
+                },
+                {
+                    "Field": "VSC name",
+                    "Match": "Yes" if verification["vsc_match"] else "Not provided/weak match",
+                },
+                {
+                    "Field": "Description",
+                    "Match": (
+                        "Yes"
+                        if verification["description_match"]
+                        else "Not provided/weak match"
+                        if not torque_description.strip()
+                        else "No"
+                    ),
+                },
                 {"Field": "Torque", "Match": "Yes" if verification["torque_match"] else "No"},
             ]
             st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
@@ -783,6 +815,8 @@ if torque_submitted:
             if verification.get("engine"):
                 engine = verification["engine"]
                 st.markdown(f"**Engine:** {engine['engine_code']} - {engine['engine']}")
+            if verification.get("engines_checked"):
+                st.caption(f"Engines checked: {verification['engines_checked']}")
 
             best = verification.get("best")
             if best:
@@ -790,23 +824,37 @@ if torque_submitted:
                 st.markdown(f"**Page:** {best['page']}")
                 st.markdown(f"**Found description:** {best['description']}")
                 st.markdown(f"**Found specification:** {best['specification']}")
+                st.markdown(f"**Similarity:** {best['confidence']}%")
                 if best.get("comment"):
                     st.markdown(f"**Comment:** {best['comment']}")
 
                 candidates = verification.get("candidates", [])
-                if len(candidates) > 1:
-                    with st.expander("Other candidate matches"):
-                        candidate_rows = [
+                if candidates:
+                    st.markdown("#### Best Matches")
+                    candidate_rows = []
+                    for candidate in candidates:
+                        candidate_engine = candidate.get("engine", {})
+                        candidate_vehicle = candidate.get("vehicle", {})
+                        candidate_rows.append(
                             {
-                                "Page": candidate["page"],
-                                "Description": candidate["description"],
-                                "Specification": candidate["specification"],
-                                "Description Score": round(candidate["description_score"], 2),
+                                "Similarity": f"{candidate['confidence']}%",
+                                "Description Similarity": f"{round(candidate['description_score'] * 100, 1)}%",
+                                "Torque Similarity": f"{round(candidate['torque_score'] * 100, 1)}%",
                                 "Torque Match": "Yes" if candidate["torque_match"] else "No",
+                                "Actual Description": candidate["description"],
+                                "Actual Torque": candidate["specification"],
+                                "Comment": candidate.get("comment", ""),
+                                "Engine Code": candidate_engine.get("engine_code", ""),
+                                "Engine": candidate_engine.get("engine", ""),
+                                "Vehicle": (
+                                    f"{candidate_vehicle.get('brand', '')} "
+                                    f"{candidate_vehicle.get('model', '')} "
+                                    f"{candidate_vehicle.get('version', '')}"
+                                ).strip(),
+                                "Page": candidate["page"],
                             }
-                            for candidate in candidates[1:]
-                        ]
-                        st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, hide_index=True)
+                        )
+                    st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, hide_index=True)
             else:
                 st.info(verification.get("message", "No matching torque rows found."))
 

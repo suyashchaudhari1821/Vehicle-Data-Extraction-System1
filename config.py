@@ -1,6 +1,6 @@
 """
 Configuration module for API access and headers.
-Stores base URLs, headers, and authentication cookies.
+FCA credentials are normally updated from the app sidebar at runtime.
 """
 
 import os
@@ -9,7 +9,7 @@ from typing import Dict, Optional
 
 
 def _setting(*names: str, default: str = "") -> str:
-    """Read a setting from environment variables or Streamlit secrets."""
+    """Read an optional startup prefill from environment variables or Streamlit secrets."""
     for name in names:
         value = os.environ.get(name)
         if value:
@@ -114,8 +114,8 @@ REQUEST_DELAY = 0.3  # seconds between requests
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds between retries
 
-# Cookies (to be injected from browser)
-# Format: Copy from browser DevTools > Application > Cookies
+# Optional startup cookies. The app sidebar overrides this at runtime.
+# Format: Copy from browser DevTools > Application > Cookies.
 COOKIES = _setting("FCA_COOKIES", "FCA_COOKIE", "COOKIES")
 
 

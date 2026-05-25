@@ -7,6 +7,27 @@ import os
 import time
 from typing import Dict, Optional
 
+
+def _setting(*names: str, default: str = "") -> str:
+    """Read a setting from environment variables or Streamlit secrets."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+
+    try:
+        import streamlit as st
+
+        for name in names:
+            value = st.secrets.get(name, "")
+            if value:
+                return str(value)
+    except Exception:
+        pass
+
+    return default
+
+
 # Base API URL
 BASE_URL = "https://library.fcaservices.com"
 
@@ -16,7 +37,7 @@ DEFAULT_HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Content-Type": "application/json",
     "Referer": "https://library.fcaservices.com/web/secure/dashboard/user",
-    "X-Auth-Token": "971c5794446e43108d2f563360633d5a",
+    "X-Auth-Token": _setting("FCA_X_AUTH_TOKEN", "X_AUTH_TOKEN", "AUTH_TOKEN"),
     "X-Requested-With": "XMLHttpRequest",
 }
 
@@ -95,7 +116,7 @@ RETRY_DELAY = 1  # seconds between retries
 
 # Cookies (to be injected from browser)
 # Format: Copy from browser DevTools > Application > Cookies
-COOKIES = "_gid=GA1.2.825328875.1777957635; __zlcmid=1NMmxaZDCZHSLgd; _gat_gtag_UA_73644834_2=1; _ga_ZHRD9EG2P0=GS2.1.s1777960379$o2$g1$t1777963165$j29$l0$h0; _ga=GA1.1.1157187678.1777957635; AWSALBTG=Zn6+8s5K8wRLDWcOPTh7bXLLrIfHxZDwKDcKcOWILWJiHXfhN8aP85sQ44yz6c0mN6PjeI1sZopRfY8xPI/BfWkiq0zVadXcX7WF99YP3g81/gS3QlUh/EQIH0BCXmtugWZsWM0h128EJ+Lf2AmKB2+M9bqpF9e4FqbFPjNywceAQ8bZCk6IMq8fIOL2LtAgk7lYkPBHyK/Ddy0LUep3D5tU0/GBbaYmWyc7uOp5+AX70seaeYOvv852WtM6A9viqeJrDinKB18N5rh3qRDVkPihtVrlvZC2XbyaGC3heJJ0hdjGfhPIDU9207TZiCimJ7YBQb5bvc+dnMh1zGauzCwk/hM=; AWSALBTGCORS=Zn6+8s5K8wRLDWcOPTh7bXLLrIfHxZDwKDcKcOWILWJiHXfhN8aP85sQ44yz6c0mN6PjeI1sZopRfY8xPI/BfWkiq0zVadXcX7WF99YP3g81/gS3QlUh/EQIH0BCXmtugWZsWM0h128EJ+Lf2AmKB2+M9bqpF9e4FqbFPjNywceAQ8bZCk6IMq8fIOL2LtAgk7lYkPBHyK/Ddy0LUep3D5tU0/GBbaYmWyc7uOp5+AX70seaeYOvv852WtM6A9viqeJrDinKB18N5rh3qRDVkPihtVrlvZC2XbyaGC3heJJ0hdjGfhPIDU9207TZiCimJ7YBQb5bvc+dnMh1zGauzCwk/hM=; AWSALB=6pWOyCtqJ+7CsPxCZ6epc8cFHtXVIcxj9dd+cpcfBfyTsBOjmIBiKw6sLZos1GMdNUnrJzbVHNzSIxkH2f4v+zj0VspcTnBvO2CXHwNOez+9LR6YVeHDlowi+LOh; AWSALBCORS=6pWOyCtqJ+7CsPxCZ6epc8cFHtXVIcxj9dd+cpcfBfyTsBOjmIBiKw6sLZos1GMdNUnrJzbVHNzSIxkH2f4v+zj0VspcTnBvO2CXHwNOez+9LR6YVeHDlowi+LOh"
+COOKIES = _setting("FCA_COOKIES", "FCA_COOKIE", "COOKIES")
 
 
 def get_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:

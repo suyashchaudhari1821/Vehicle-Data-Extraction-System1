@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+
+.env
+.streamlit/secrets.toml
+
+*.log
+*.db-journal
+*.db-wal
+*.db-shm
+db_backup_before_relay_fix/

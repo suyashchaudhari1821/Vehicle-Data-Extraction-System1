@@ -67,11 +67,21 @@ This will install all required packages including:
 - **pandas**: Data manipulation
 - **requests**: HTTP client
 - **openpyxl**: Excel file handling
+- **lxml/html5lib/beautifulsoup4**: HTML table parsing for torque verification
 - And all other dependencies
 
 ### Step 4: Configure API Credentials
 
-The application uses API credentials stored in `config.py`. The credentials are already configured, but you can update them if needed by editing the file.
+The application reads API credentials from Streamlit Secrets or environment variables. Do not commit tokens or cookies to `config.py`.
+
+For Streamlit Secrets, add:
+
+```toml
+FCA_X_AUTH_TOKEN = "paste_x_auth_token_here"
+FCA_COOKIES = "paste_browser_cookie_string_here"
+```
+
+You can also paste updated credentials in the app sidebar under **Update Authentication**.
 
 ## Running the Application
 
@@ -93,6 +103,8 @@ the refreshed `vehicle_data.db` after restart, configure GitHub DB sync in
 Streamlit Secrets:
 
 ```toml
+FCA_X_AUTH_TOKEN = "paste_x_auth_token_here"
+FCA_COOKIES = "paste_browser_cookie_string_here"
 GITHUB_DB_SYNC_ENABLED = "true"
 GITHUB_TOKEN = "github_pat_your_token_here"
 GITHUB_REPO = "suyashchaudhari1821/Vehicle-Data-Extraction-System1"
@@ -135,7 +147,7 @@ python extract_by_brand.py
 ## API Integration Details
 
 - **Base URL**: `https://library.fcaservices.com`
-- **Authentication**: X-Auth-Token (already configured)
+- **Authentication**: X-Auth-Token and browser cookies from Streamlit Secrets, environment variables, or the app sidebar
 - **Endpoints**:
   - Models: `/connect/api/vehicle/models/categorized`
   - Engines: `/connect/api/vehicle/engines`
@@ -151,7 +163,7 @@ pip install -r requirements.txt
 ### Issue: API Connection Errors
 **Solution**: 
 - Check your internet connection
-- Verify the API token in `config.py` is valid and not expired
+- Verify the API token and cookies in Streamlit Secrets or the app sidebar are valid and not expired
 - Check if the FCA Services API is accessible
 
 ### Issue: Excel Export Fails

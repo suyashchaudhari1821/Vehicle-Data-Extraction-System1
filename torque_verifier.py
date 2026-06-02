@@ -55,19 +55,34 @@ def _get_torque_content(leaf: Dict[str, str], model_version_engine_id: str) -> s
         if response is None or response.status_code not in {400, 404}:
             raise
 
-    params = {
-        "infoCode": leaf.get("info_code") or "undefined",
-        "locale": config.MODEL_LOCALE,
-        "container": "main",
-    }
-    auth_token = config.get_auth_token()
-    if auth_token:
-        params["X-Auth-Token"] = auth_token
+    context_path = f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}"
+    info_codes = [leaf.get("info_code") or "undefined", "undefined", "", None]
+    last_error = None
+    seen = set()
+    for info_code in info_codes:
+        marker = "<missing>" if info_code is None else info_code
+        if marker in seen:
+            continue
+        seen.add(marker)
 
-    return _get_text(
-        f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
-        params=params,
-    )
+        params = {"locale": config.MODEL_LOCALE, "container": "main"}
+        if info_code is not None:
+            params["infoCode"] = info_code
+        auth_token = config.get_auth_token()
+        if auth_token:
+            params["X-Auth-Token"] = auth_token
+
+        try:
+            return _get_text(context_path, params=params)
+        except requests.HTTPError as exc:
+            last_error = exc
+            response = exc.response
+            if response is None or response.status_code not in {400, 404}:
+                raise
+
+    if last_error:
+        raise last_error
+    return _get_text(context_path)
 
 
 def _walk(value: Any) -> Iterable[Any]:

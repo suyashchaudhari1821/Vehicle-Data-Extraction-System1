@@ -6,6 +6,7 @@ import config
 import exporter
 import re
 import hmac
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from collections import defaultdict
 import io
 import os
@@ -73,6 +74,25 @@ def require_login():
             st.error("Invalid email or password.")
 
     st.stop()
+
+
+def redact_url_secrets(message):
+    """Hide token query parameters before showing request errors in the UI."""
+    def replace_url(match):
+        url = match.group(0)
+        try:
+            parts = urlsplit(url)
+            query = []
+            for key, value in parse_qsl(parts.query, keep_blank_values=True):
+                if key.lower() in {"x-auth-token", "token"}:
+                    query.append((key, "REDACTED"))
+                else:
+                    query.append((key, value))
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+        except Exception:
+            return url
+
+    return re.sub(r"https?://[^\s]+", replace_url, str(message))
 
 
 require_login()
@@ -770,7 +790,7 @@ if torque_submitted:
                     torque_target,
                 )
             except Exception as exc:
-                st.error(f"Torque verification failed: {exc}")
+                st.error(f"Torque verification failed: {redact_url_secrets(exc)}")
                 verification = None
 
         if verification:

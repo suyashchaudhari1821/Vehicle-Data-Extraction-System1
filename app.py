@@ -770,14 +770,7 @@ if torque_submitted:
                     torque_target,
                 )
             except Exception as exc:
-                if "/connect/api/content/raw/" in str(exc):
-                    st.error(
-                        "Torque verification could not read one Service Library content page. "
-                        "The app has skipped this type of page in the latest build; please wait "
-                        "for the deployment to finish and retry."
-                    )
-                else:
-                    st.error(f"Torque verification failed: {exc}")
+                st.error(f"Torque verification failed: {exc}")
                 verification = None
 
         if verification:
@@ -870,16 +863,18 @@ if torque_submitted:
                     f"Checked {verification['torque_pages_checked']} of "
                     f"{verification['torque_pages_found']} torque pages."
                 )
+            if verification.get("readable_content_pages") is not None:
+                st.caption(f"Read {verification['readable_content_pages']} torque page(s).")
             if verification.get("torque_rows_found") is not None:
                 st.caption(f"Parsed {verification['torque_rows_found']} torque row(s).")
-            if verification.get("skipped_content_pages"):
+            if verification.get("unreadable_content_pages"):
                 st.warning(
-                    f"Skipped {verification['skipped_content_pages']} torque page(s) because "
-                    "Service Library rejected their raw content request."
+                    f"{verification['unreadable_content_pages']} Service Library torque page(s) "
+                    "could not be read. The result may be incomplete."
                 )
                 content_errors = verification.get("content_errors", [])
                 if content_errors:
-                    with st.expander("Skipped torque page details"):
+                    with st.expander("Unreadable torque page details"):
                         st.dataframe(pd.DataFrame(content_errors), use_container_width=True, hide_index=True)
 
 st.divider()

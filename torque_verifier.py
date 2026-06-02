@@ -78,24 +78,31 @@ def _raw_content_params(leaf: Dict[str, str], info_code: Optional[str]) -> Dict[
     return params
 
 
+def _raw_content_paths(leaf: Dict[str, str], model_version_engine_id: str) -> List[str]:
+    return [
+        f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
+        f"/connect/api/content/raw/{leaf['content_link_id']}",
+    ]
+
+
 def _get_raw_content(leaf: Dict[str, str], model_version_engine_id: str) -> str:
-    path = f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}"
     info_codes = [leaf.get("info_code") or "undefined", "undefined", "", None]
     seen = set()
     last_error = None
 
-    for info_code in info_codes:
-        marker = ("missing",) if info_code is None else ("value", info_code)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        try:
-            return _get_text(path, params=_raw_content_params(leaf, info_code))
-        except requests.RequestException as exc:
-            last_error = exc
-            if _is_skippable_content_error(exc):
+    for path in _raw_content_paths(leaf, model_version_engine_id):
+        for info_code in info_codes:
+            marker = (path, "missing") if info_code is None else (path, "value", info_code)
+            if marker in seen:
                 continue
-            raise
+            seen.add(marker)
+            try:
+                return _get_text(path, params=_raw_content_params(leaf, info_code))
+            except requests.RequestException as exc:
+                last_error = exc
+                if _is_raw_content_error(exc):
+                    continue
+                raise
 
     if last_error:
         raise last_error
@@ -115,7 +122,7 @@ def _content_error_message(exc: requests.RequestException) -> str:
     return f"{response.status_code} {response.reason}"
 
 
-def _is_skippable_content_error(exc: requests.RequestException) -> bool:
+def _is_raw_content_error(exc: requests.RequestException) -> bool:
     response = exc.response
     if response is None:
         return False
@@ -483,10 +490,11 @@ def verify_torque(
     selected_engine = engine_targets[0]["engine"]
     pages_found = 0
     pages_checked = 0
+    readable_content_pages = 0
     rows_found = 0
     engine_books_checked = 0
     missing_books = 0
-    skipped_content_pages = 0
+    unreadable_content_pages = 0
     content_errors = []
 
     for target in engine_targets:
@@ -516,18 +524,17 @@ def verify_torque(
             try:
                 html = _get_raw_content(leaf, engine["model_version_engine_id"])
             except requests.RequestException as exc:
-                if _is_skippable_content_error(exc):
-                    skipped_content_pages += 1
-                    if len(content_errors) < 5:
-                        content_errors.append(
-                            {
-                                "page": leaf["path"],
-                                "content_link_id": leaf["content_link_id"],
-                                "error": _content_error_message(exc),
-                            }
-                        )
-                    continue
-                raise
+                unreadable_content_pages += 1
+                if len(content_errors) < 5:
+                    content_errors.append(
+                        {
+                            "page": leaf["path"],
+                            "content_link_id": leaf["content_link_id"],
+                            "error": _content_error_message(exc),
+                        }
+                    )
+                continue
+            readable_content_pages += 1
             torque_rows = _extract_torque_rows(html, leaf)
             rows_found += len(torque_rows)
             for row in torque_rows:
@@ -563,23 +570,33 @@ def verify_torque(
     candidates = sorted(all_candidates, key=lambda row: row["score"], reverse=True)[:5]
     best = candidates[0] if candidates else None
     if not best:
+        if unreadable_content_pages:
+            status = "Incomplete"
+            message = (
+                "No matching torque rows were found in readable pages, but "
+                "some Service Library pages could not be read."
+            )
+        else:
+            status = "Not found"
+            message = "No matching torque rows were found."
         return {
             "vehicle_match": True,
             "engine_match": engine_code_was_provided,
             "vsc_match": False,
             "description_match": False,
             "torque_match": False,
-            "status": "Not found",
+            "status": status,
             "confidence": 0,
-            "message": "No matching torque rows were found.",
+            "message": message,
             "vehicle": selected_vehicle,
             "engine": selected_engine,
             "engines_checked": len(engine_targets),
             "candidates": [],
             "torque_pages_checked": pages_checked,
             "torque_pages_found": pages_found,
+            "readable_content_pages": readable_content_pages,
             "torque_rows_found": rows_found,
-            "skipped_content_pages": skipped_content_pages,
+            "unreadable_content_pages": unreadable_content_pages,
             "content_errors": content_errors,
         }
 
@@ -612,7 +629,8 @@ def verify_torque(
         "candidates": candidates,
         "torque_pages_checked": pages_checked,
         "torque_pages_found": pages_found,
+        "readable_content_pages": readable_content_pages,
         "torque_rows_found": rows_found,
-        "skipped_content_pages": skipped_content_pages,
+        "unreadable_content_pages": unreadable_content_pages,
         "content_errors": content_errors,
     }

@@ -196,6 +196,33 @@ with st.sidebar:
                                 st.error("No data - credentials may be invalid")
                     except Exception as e:
                         st.error(f"Connection failed: {str(e)}")
+
+    with st.expander("Torque API Diagnostics", expanded=False):
+        diag_col1, diag_col2, diag_col3 = st.columns(3)
+        with diag_col1:
+            diag_year = st.number_input("Year", min_value=1900, max_value=2100, value=2026, step=1, key="diag_year")
+        with diag_col2:
+            diag_family = st.text_input("VEH FAM", value="JL", key="diag_family")
+        with diag_col3:
+            diag_engine = st.text_input("Engine", value="ESG", key="diag_engine")
+
+        if st.button("Run Torque API Check", use_container_width=True):
+            with st.spinner("Checking torque API chain..."):
+                try:
+                    diagnostic = torque_verifier.diagnose_torque_api(
+                        int(diag_year),
+                        diag_family.strip(),
+                        diag_engine.strip(),
+                    )
+                    st.dataframe(pd.DataFrame(diagnostic["steps"]), use_container_width=True, hide_index=True)
+                    if diagnostic.get("raw_content_attempts"):
+                        st.dataframe(
+                            pd.DataFrame(diagnostic["raw_content_attempts"]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                except Exception as exc:
+                    st.error(f"Torque API check failed: {redact_url_secrets(exc)}")
     
     st.divider()
     

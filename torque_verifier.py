@@ -85,6 +85,97 @@ def _get_torque_content(leaf: Dict[str, str], model_version_engine_id: str) -> s
     return _get_text(context_path)
 
 
+def _request_status(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        text = _get_text(path, params=params)
+        return {"ok": True, "status": "OK", "detail": f"{len(text)} chars"}
+    except requests.RequestException as exc:
+        response = exc.response
+        if response is None:
+            return {"ok": False, "status": exc.__class__.__name__, "detail": str(exc)}
+        return {"ok": False, "status": str(response.status_code), "detail": response.reason}
+
+
+def diagnose_torque_api(
+    model_year: int,
+    vehicle_family: str,
+    engine_code: str,
+) -> Dict[str, Any]:
+    """Run a safe end-to-end torque API diagnostic without exposing credentials."""
+    steps = []
+
+    def add(step: str, ok: bool, detail: str) -> None:
+        steps.append({"Step": step, "Result": "OK" if ok else "Failed", "Details": detail})
+
+    vehicles = _find_vehicle_versions(model_year, vehicle_family)
+    add("Vehicle lookup", bool(vehicles), f"{len(vehicles)} vehicle match(es)")
+    if not vehicles:
+        return {"steps": steps, "raw_content_attempts": []}
+
+    engine_targets, checked_engines = _build_engine_targets(vehicles, engine_code)
+    add(
+        "Engine lookup",
+        bool(engine_targets),
+        f"{len(engine_targets)} engine target(s), {len(checked_engines)} vehicle(s) checked",
+    )
+    if not engine_targets:
+        return {"steps": steps, "raw_content_attempts": []}
+
+    target = engine_targets[0]
+    engine = target["engine"]
+    service_book = _get_service_book(engine["model_version_engine_id"])
+    add("Service book lookup", bool(service_book), service_book.get("modelVersionBookId", "") if service_book else "")
+    if not service_book:
+        return {"steps": steps, "raw_content_attempts": []}
+
+    toc = _get_json(
+        f"/connect/api/toc/{service_book['modelVersionBookId']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}",
+        params={"locale": config.MODEL_LOCALE, "nocache": str(int(time.time() * 1000))},
+    )
+    leaves = _rank_leaves(_collect_torque_leaves(toc), "")
+    add("Torque TOC lookup", bool(leaves), f"{len(leaves)} torque page(s)")
+    if not leaves:
+        return {"steps": steps, "raw_content_attempts": []}
+
+    leaf = leaves[0]
+    context_path = f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}"
+    auth_token = config.get_auth_token()
+    raw_attempts = []
+    attempts = [
+        ("Simple raw content", f"/connect/api/content/raw/{leaf['content_link_id']}", None),
+    ]
+    for label, info_code in (
+        ("Context raw content: TOC infoCode", leaf.get("info_code") or "undefined"),
+        ("Context raw content: undefined infoCode", "undefined"),
+        ("Context raw content: blank infoCode", ""),
+        ("Context raw content: no infoCode", None),
+    ):
+        params = {"locale": config.MODEL_LOCALE, "container": "main"}
+        if info_code is not None:
+            params["infoCode"] = info_code
+        if auth_token:
+            params["X-Auth-Token"] = auth_token
+        attempts.append((label, context_path, params))
+
+    for label, path, params in attempts:
+        status = _request_status(path, params=params)
+        raw_attempts.append(
+            {
+                "Attempt": label,
+                "Result": "OK" if status["ok"] else "Failed",
+                "Status": status["status"],
+                "Details": status["detail"],
+            }
+        )
+
+    add(
+        "Raw content lookup",
+        any(attempt["Result"] == "OK" for attempt in raw_attempts),
+        f"{sum(attempt['Result'] == 'OK' for attempt in raw_attempts)} successful raw content variant(s)",
+    )
+    return {"steps": steps, "raw_content_attempts": raw_attempts}
+
+
 def _walk(value: Any) -> Iterable[Any]:
     yield value
     if isinstance(value, dict):

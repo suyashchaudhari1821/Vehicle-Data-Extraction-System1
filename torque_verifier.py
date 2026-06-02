@@ -55,34 +55,38 @@ def _get_torque_content(leaf: Dict[str, str], model_version_engine_id: str) -> s
         if response is None or response.status_code not in {400, 404}:
             raise
 
-    context_path = f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}"
+    context_paths = [
+        f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
+        f"/connect/api/discipline/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
+    ]
     info_codes = [leaf.get("info_code") or "undefined", "undefined", "", None]
     last_error = None
     seen = set()
-    for info_code in info_codes:
-        marker = "<missing>" if info_code is None else info_code
-        if marker in seen:
-            continue
-        seen.add(marker)
+    for context_path in context_paths:
+        for info_code in info_codes:
+            marker = (context_path, "<missing>" if info_code is None else info_code)
+            if marker in seen:
+                continue
+            seen.add(marker)
 
-        params = {"locale": config.MODEL_LOCALE, "container": "main"}
-        if info_code is not None:
-            params["infoCode"] = info_code
-        auth_token = config.get_auth_token()
-        if auth_token:
-            params["X-Auth-Token"] = auth_token
+            params = {"locale": config.MODEL_LOCALE, "container": "main"}
+            if info_code is not None:
+                params["infoCode"] = info_code
+            auth_token = config.get_auth_token()
+            if auth_token:
+                params["X-Auth-Token"] = auth_token
 
-        try:
-            return _get_text(context_path, params=params)
-        except requests.HTTPError as exc:
-            last_error = exc
-            response = exc.response
-            if response is None or response.status_code not in {400, 404}:
-                raise
+            try:
+                return _get_text(context_path, params=params)
+            except requests.HTTPError as exc:
+                last_error = exc
+                response = exc.response
+                if response is None or response.status_code not in {400, 404}:
+                    raise
 
     if last_error:
         raise last_error
-    return _get_text(context_path)
+    return _get_text(context_paths[0])
 
 
 def _request_status(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -138,24 +142,28 @@ def diagnose_torque_api(
         return {"steps": steps, "raw_content_attempts": []}
 
     leaf = leaves[0]
-    context_path = f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}"
+    context_paths = [
+        ("Content context raw", f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}"),
+        ("Discipline context raw", f"/connect/api/discipline/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}"),
+    ]
     auth_token = config.get_auth_token()
     raw_attempts = []
     attempts = [
         ("Simple raw content", f"/connect/api/content/raw/{leaf['content_link_id']}", None),
     ]
-    for label, info_code in (
-        ("Context raw content: TOC infoCode", leaf.get("info_code") or "undefined"),
-        ("Context raw content: undefined infoCode", "undefined"),
-        ("Context raw content: blank infoCode", ""),
-        ("Context raw content: no infoCode", None),
-    ):
-        params = {"locale": config.MODEL_LOCALE, "container": "main"}
-        if info_code is not None:
-            params["infoCode"] = info_code
-        if auth_token:
-            params["X-Auth-Token"] = auth_token
-        attempts.append((label, context_path, params))
+    for path_label, context_path in context_paths:
+        for info_label, info_code in (
+            ("TOC infoCode", leaf.get("info_code") or "undefined"),
+            ("undefined infoCode", "undefined"),
+            ("blank infoCode", ""),
+            ("no infoCode", None),
+        ):
+            params = {"locale": config.MODEL_LOCALE, "container": "main"}
+            if info_code is not None:
+                params["infoCode"] = info_code
+            if auth_token:
+                params["X-Auth-Token"] = auth_token
+            attempts.append((f"{path_label}: {info_label}", context_path, params))
 
     for label, path, params in attempts:
         status = _request_status(path, params=params)

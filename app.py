@@ -870,6 +870,8 @@ if torque_submitted:
                     f"Checked {verification['torque_pages_checked']} of "
                     f"{verification['torque_pages_found']} torque pages."
                 )
+            if verification.get("torque_rows_found") is not None:
+                st.caption(f"Parsed {verification['torque_rows_found']} torque row(s).")
             if verification.get("skipped_content_pages"):
                 st.warning(
                     f"Skipped {verification['skipped_content_pages']} torque page(s) because "

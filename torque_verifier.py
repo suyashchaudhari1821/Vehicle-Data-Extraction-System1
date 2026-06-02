@@ -15,19 +15,6 @@ import parser
 
 CONFIG_LEVEL = "YEAR_MODEL_ENGINE"
 REQUEST_TIMEOUT = 30
-TEXT_ABBREVIATIONS = {
-    "rr": "rear",
-    "fr": "front",
-    "frt": "front",
-    "lh": "left",
-    "rh": "right",
-    "lwr": "lower",
-    "upr": "upper",
-    "ctrl": "control",
-    "assy": "assembly",
-    "brkt": "bracket",
-    "mbr": "member",
-}
 
 
 def _headers(accept: str = "application/json, text/javascript, */*; q=0.01") -> Dict[str, str]:
@@ -60,74 +47,27 @@ def _get_text(path: str, params: Optional[Dict[str, Any]] = None) -> str:
     return response.text
 
 
-def _raw_content_params(leaf: Dict[str, str], info_code: Optional[str]) -> Dict[str, str]:
+def _get_torque_content(leaf: Dict[str, str], model_version_engine_id: str) -> str:
+    try:
+        return _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is None or response.status_code not in {400, 404}:
+            raise
+
     params = {
         "infoCode": leaf.get("info_code") or "undefined",
         "locale": config.MODEL_LOCALE,
         "container": "main",
     }
-    if info_code is None:
-        params.pop("infoCode", None)
-    else:
-        params["infoCode"] = info_code
-
     auth_token = config.get_auth_token()
     if auth_token:
         params["X-Auth-Token"] = auth_token
 
-    return params
-
-
-def _raw_content_paths(leaf: Dict[str, str], model_version_engine_id: str) -> List[str]:
-    return [
+    return _get_text(
         f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
-        f"/connect/api/content/raw/{leaf['content_link_id']}",
-    ]
-
-
-def _get_raw_content(leaf: Dict[str, str], model_version_engine_id: str) -> str:
-    info_codes = [leaf.get("info_code") or "undefined", "undefined", "", None]
-    seen = set()
-    last_error = None
-
-    for path in _raw_content_paths(leaf, model_version_engine_id):
-        for info_code in info_codes:
-            marker = (path, "missing") if info_code is None else (path, "value", info_code)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            try:
-                return _get_text(path, params=_raw_content_params(leaf, info_code))
-            except requests.RequestException as exc:
-                last_error = exc
-                if _is_raw_content_error(exc):
-                    continue
-                raise
-
-    if last_error:
-        raise last_error
-    return _get_text(path, params=_raw_content_params(leaf, leaf.get("info_code") or "undefined"))
-
-
-def _content_error_message(exc: requests.RequestException) -> str:
-    response = exc.response
-    if response is None:
-        return str(exc)
-
-    detail = _clean_text(response.text)
-    if len(detail) > 180:
-        detail = f"{detail[:177]}..."
-    if detail:
-        return f"{response.status_code} {response.reason}: {detail}"
-    return f"{response.status_code} {response.reason}"
-
-
-def _is_raw_content_error(exc: requests.RequestException) -> bool:
-    response = exc.response
-    if response is None:
-        return False
-    request_url = response.url or ""
-    return response.status_code in {400, 404} and "/connect/api/content/raw/" in request_url
+        params=params,
+    )
 
 
 def _walk(value: Any) -> Iterable[Any]:
@@ -145,8 +85,7 @@ def _clean_text(value: Any) -> str:
 
 
 def _match_key(value: Any) -> str:
-    key = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
-    return " ".join(TEXT_ABBREVIATIONS.get(term, term) for term in key.split())
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
 def _compact_code(value: Any) -> str:
@@ -347,26 +286,11 @@ def _extract_torque_rows(content_html: str, leaf: Dict[str, str]) -> List[Dict[s
         return rows
 
     for table in tables:
-        normalized_columns = [
-            _match_key(" ".join(map(str, column)) if isinstance(column, tuple) else column).upper()
-            for column in table.columns
-        ]
-
-        def find_column(*names: str) -> Any:
-            for name in names:
-                if name in normalized_columns:
-                    return table.columns[normalized_columns.index(name)]
-            for index, column_name in enumerate(normalized_columns):
-                if any(name in column_name for name in names):
-                    return table.columns[index]
-            return None
-
-        description_column = find_column("DESCRIPTION")
-        if description_column is None:
+        normalized_columns = [_match_key(column).upper() for column in table.columns]
+        if "DESCRIPTION" not in normalized_columns or "SPECIFICATION" not in normalized_columns:
             continue
-        specification_column = find_column("SPECIFICATION", "TORQUE", "TORQUE SPECIFICATION", "VALUE")
-        if specification_column is None:
-            continue
+        description_column = table.columns[normalized_columns.index("DESCRIPTION")]
+        specification_column = table.columns[normalized_columns.index("SPECIFICATION")]
         comment_column = None
         if "COMMENT" in normalized_columns:
             comment_column = table.columns[normalized_columns.index("COMMENT")]
@@ -490,12 +414,8 @@ def verify_torque(
     selected_engine = engine_targets[0]["engine"]
     pages_found = 0
     pages_checked = 0
-    readable_content_pages = 0
-    rows_found = 0
     engine_books_checked = 0
     missing_books = 0
-    unreadable_content_pages = 0
-    content_errors = []
 
     for target in engine_targets:
         vehicle = target["vehicle"]
@@ -515,29 +435,18 @@ def verify_torque(
         if not leaves:
             continue
 
-        # VSC name is only a ranking hint. Search every torque page so wording
-        # differences in the TOC cannot hide the correct row.
-        leaves_to_check = leaves
+        # VSC name is a ranking hint. Search the best pages first, but keep enough
+        # breadth for cases where Excel wording differs from Service Library TOC.
+        strong_vsc_leaves = [leaf for leaf in leaves if leaf["vsc_score"] >= 0.35]
+        if vsc_name.strip():
+            leaves_to_check = strong_vsc_leaves[:12] if strong_vsc_leaves else leaves[:25]
+        else:
+            leaves_to_check = leaves[:35]
 
         for leaf in leaves_to_check:
             pages_checked += 1
-            try:
-                html = _get_raw_content(leaf, engine["model_version_engine_id"])
-            except requests.RequestException as exc:
-                unreadable_content_pages += 1
-                if len(content_errors) < 5:
-                    content_errors.append(
-                        {
-                            "page": leaf["path"],
-                            "content_link_id": leaf["content_link_id"],
-                            "error": _content_error_message(exc),
-                        }
-                    )
-                continue
-            readable_content_pages += 1
-            torque_rows = _extract_torque_rows(html, leaf)
-            rows_found += len(torque_rows)
-            for row in torque_rows:
+            html = _get_torque_content(leaf, engine["model_version_engine_id"])
+            for row in _extract_torque_rows(html, leaf):
                 candidate = _score_torque_row(row, leaf, description, target_torque)
                 candidate["vehicle"] = vehicle
                 candidate["engine"] = engine
@@ -570,34 +479,21 @@ def verify_torque(
     candidates = sorted(all_candidates, key=lambda row: row["score"], reverse=True)[:5]
     best = candidates[0] if candidates else None
     if not best:
-        if unreadable_content_pages:
-            status = "Incomplete"
-            message = (
-                "No matching torque rows were found in readable pages, but "
-                "some Service Library pages could not be read."
-            )
-        else:
-            status = "Not found"
-            message = "No matching torque rows were found."
         return {
             "vehicle_match": True,
             "engine_match": engine_code_was_provided,
             "vsc_match": False,
             "description_match": False,
             "torque_match": False,
-            "status": status,
+            "status": "Not found",
             "confidence": 0,
-            "message": message,
+            "message": "No matching torque rows were found.",
             "vehicle": selected_vehicle,
             "engine": selected_engine,
             "engines_checked": len(engine_targets),
             "candidates": [],
             "torque_pages_checked": pages_checked,
             "torque_pages_found": pages_found,
-            "readable_content_pages": readable_content_pages,
-            "torque_rows_found": rows_found,
-            "unreadable_content_pages": unreadable_content_pages,
-            "content_errors": content_errors,
         }
 
     description_match = bool(description.strip() and best["description_score"] >= 0.65)
@@ -629,8 +525,4 @@ def verify_torque(
         "candidates": candidates,
         "torque_pages_checked": pages_checked,
         "torque_pages_found": pages_found,
-        "readable_content_pages": readable_content_pages,
-        "torque_rows_found": rows_found,
-        "unreadable_content_pages": unreadable_content_pages,
-        "content_errors": content_errors,
     }

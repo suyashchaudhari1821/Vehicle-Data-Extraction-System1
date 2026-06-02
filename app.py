@@ -863,6 +863,15 @@ if torque_submitted:
                     f"Checked {verification['torque_pages_checked']} of "
                     f"{verification['torque_pages_found']} torque pages."
                 )
+            if verification.get("skipped_content_pages"):
+                st.warning(
+                    f"Skipped {verification['skipped_content_pages']} torque page(s) because "
+                    "Service Library rejected their raw content request."
+                )
+                content_errors = verification.get("content_errors", [])
+                if content_errors:
+                    with st.expander("Skipped torque page details"):
+                        st.dataframe(pd.DataFrame(content_errors), use_container_width=True, hide_index=True)
 
 st.divider()
 

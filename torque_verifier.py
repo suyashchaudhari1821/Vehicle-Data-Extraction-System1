@@ -47,6 +47,19 @@ def _get_text(path: str, params: Optional[Dict[str, Any]] = None) -> str:
     return response.text
 
 
+def _content_error_message(exc: requests.HTTPError) -> str:
+    response = exc.response
+    if response is None:
+        return str(exc)
+
+    detail = _clean_text(response.text)
+    if len(detail) > 180:
+        detail = f"{detail[:177]}..."
+    if detail:
+        return f"{response.status_code} {response.reason}: {detail}"
+    return f"{response.status_code} {response.reason}"
+
+
 def _walk(value: Any) -> Iterable[Any]:
     yield value
     if isinstance(value, dict):
@@ -393,6 +406,8 @@ def verify_torque(
     pages_checked = 0
     engine_books_checked = 0
     missing_books = 0
+    skipped_content_pages = 0
+    content_errors = []
 
     for target in engine_targets:
         vehicle = target["vehicle"]
@@ -422,7 +437,22 @@ def verify_torque(
 
         for leaf in leaves_to_check:
             pages_checked += 1
-            html = _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
+            try:
+                html = _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code in {400, 404}:
+                    skipped_content_pages += 1
+                    if len(content_errors) < 5:
+                        content_errors.append(
+                            {
+                                "page": leaf["path"],
+                                "content_link_id": leaf["content_link_id"],
+                                "error": _content_error_message(exc),
+                            }
+                        )
+                    continue
+                raise
             for row in _extract_torque_rows(html, leaf):
                 candidate = _score_torque_row(row, leaf, description, target_torque)
                 candidate["vehicle"] = vehicle
@@ -471,6 +501,8 @@ def verify_torque(
             "candidates": [],
             "torque_pages_checked": pages_checked,
             "torque_pages_found": pages_found,
+            "skipped_content_pages": skipped_content_pages,
+            "content_errors": content_errors,
         }
 
     description_match = bool(description.strip() and best["description_score"] >= 0.65)
@@ -502,4 +534,6 @@ def verify_torque(
         "candidates": candidates,
         "torque_pages_checked": pages_checked,
         "torque_pages_found": pages_found,
+        "skipped_content_pages": skipped_content_pages,
+        "content_errors": content_errors,
     }

@@ -815,8 +815,6 @@ if torque_submitted:
             if verification.get("engine"):
                 engine = verification["engine"]
                 st.markdown(f"**Engine:** {engine['engine_code']} - {engine['engine']}")
-            if verification.get("engines_checked"):
-                st.caption(f"Engines checked: {verification['engines_checked']}")
 
             best = verification.get("best")
             if best:
@@ -857,25 +855,6 @@ if torque_submitted:
                     st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, hide_index=True)
             else:
                 st.info(verification.get("message", "No matching torque rows found."))
-
-            if verification.get("torque_pages_found") is not None:
-                st.caption(
-                    f"Checked {verification['torque_pages_checked']} of "
-                    f"{verification['torque_pages_found']} torque pages."
-                )
-            if verification.get("readable_content_pages") is not None:
-                st.caption(f"Read {verification['readable_content_pages']} torque page(s).")
-            if verification.get("torque_rows_found") is not None:
-                st.caption(f"Parsed {verification['torque_rows_found']} torque row(s).")
-            if verification.get("unreadable_content_pages"):
-                st.warning(
-                    f"{verification['unreadable_content_pages']} Service Library torque page(s) "
-                    "could not be read. The result may be incomplete."
-                )
-                content_errors = verification.get("content_errors", [])
-                if content_errors:
-                    with st.expander("Unreadable torque page details"):
-                        st.dataframe(pd.DataFrame(content_errors), use_container_width=True, hide_index=True)
 
 st.divider()
 

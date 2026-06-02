@@ -100,6 +100,41 @@ def _request_status(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[
         return {"ok": False, "status": str(response.status_code), "detail": response.reason}
 
 
+def _get_content_metadata(leaf: Dict[str, str], model_version_engine_id: str) -> Dict[str, Any]:
+    return _get_json(
+        f"/connect/api/metadata/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
+        params={"locale": config.MODEL_LOCALE, "infoCode": leaf.get("info_code") or "undefined"},
+    )
+
+
+def _plugin_iframe_params(
+    leaf: Dict[str, str],
+    model_version_engine_id: str,
+    metadata: Dict[str, Any],
+) -> Dict[str, str]:
+    auth_token = config.get_auth_token()
+    return {
+        "contentLinkId": leaf["content_link_id"],
+        "infoCode": leaf.get("info_code") or "undefined",
+        "externalContentKey": metadata.get("externalContentKey") or "",
+        "infoTypeCode": metadata.get("infoTypeCode") or "",
+        "configLevel": CONFIG_LEVEL,
+        "configId": model_version_engine_id,
+        "contentType": metadata.get("contentType") or "",
+        "contentPluginType": metadata.get("contentPluginType") or "",
+        "X-Auth-Token": auth_token,
+        "height": "800",
+        "width": "1200",
+        "container": "main",
+        "anchorTag": "",
+        "serviceActionId": metadata.get("serviceActionId") or "",
+        "vehicleIssueId": metadata.get("vehicleIssueId") or "",
+        "acknowledgementServiceActionId": metadata.get("acknowledgementServiceActionId") or "",
+        "resolutionServiceActionId": metadata.get("resolutionServiceActionId") or "",
+        "feedbackSubmissionTypeList": metadata.get("feedbackSubmissionTypeList") or "",
+    }
+
+
 def diagnose_torque_api(
     model_year: int,
     vehicle_family: str,
@@ -142,6 +177,30 @@ def diagnose_torque_api(
         return {"steps": steps, "raw_content_attempts": []}
 
     leaf = leaves[0]
+    metadata = _get_content_metadata(leaf, engine["model_version_engine_id"])
+    access_ok = bool(
+        metadata.get("subscription", {}).get("allowsAccess", True)
+        and metadata.get("restriction", {}).get("userHasAllRestrictions", True)
+    )
+    add(
+        "Content metadata lookup",
+        access_ok,
+        (
+            f"{metadata.get('contentType', '')}/{metadata.get('contentPluginType', '')}; "
+            f"external key {metadata.get('externalContentKey', '')}"
+        ),
+    )
+
+    plugin_status = _request_status(
+        "/web/secure/api/plugin/iframe",
+        params=_plugin_iframe_params(leaf, engine["model_version_engine_id"], metadata),
+    )
+    add(
+        "Plugin iframe lookup",
+        plugin_status["ok"],
+        f"{plugin_status['status']}; {plugin_status['detail']}",
+    )
+
     context_paths = [
         ("Content context raw", f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}"),
         ("Discipline context raw", f"/connect/api/discipline/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{engine['model_version_engine_id']}"),

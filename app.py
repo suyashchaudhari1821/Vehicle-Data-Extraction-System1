@@ -770,7 +770,14 @@ if torque_submitted:
                     torque_target,
                 )
             except Exception as exc:
-                st.error(f"Torque verification failed: {exc}")
+                if "/connect/api/content/raw/" in str(exc):
+                    st.error(
+                        "Torque verification could not read one Service Library content page. "
+                        "The app has skipped this type of page in the latest build; please wait "
+                        "for the deployment to finish and retry."
+                    )
+                else:
+                    st.error(f"Torque verification failed: {exc}")
                 verification = None
 
         if verification:

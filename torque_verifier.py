@@ -47,7 +47,7 @@ def _get_text(path: str, params: Optional[Dict[str, Any]] = None) -> str:
     return response.text
 
 
-def _content_error_message(exc: requests.HTTPError) -> str:
+def _content_error_message(exc: requests.RequestException) -> str:
     response = exc.response
     if response is None:
         return str(exc)
@@ -58,6 +58,14 @@ def _content_error_message(exc: requests.HTTPError) -> str:
     if detail:
         return f"{response.status_code} {response.reason}: {detail}"
     return f"{response.status_code} {response.reason}"
+
+
+def _is_skippable_content_error(exc: requests.RequestException) -> bool:
+    response = exc.response
+    if response is None:
+        return False
+    request_url = response.url or ""
+    return response.status_code in {400, 404} and "/connect/api/content/raw/" in request_url
 
 
 def _walk(value: Any) -> Iterable[Any]:
@@ -439,9 +447,8 @@ def verify_torque(
             pages_checked += 1
             try:
                 html = _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
-            except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                if status_code in {400, 404}:
+            except requests.RequestException as exc:
+                if _is_skippable_content_error(exc):
                     skipped_content_pages += 1
                     if len(content_errors) < 5:
                         content_errors.append(

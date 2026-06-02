@@ -47,6 +47,22 @@ def _get_text(path: str, params: Optional[Dict[str, Any]] = None) -> str:
     return response.text
 
 
+def _get_raw_content(leaf: Dict[str, str], model_version_engine_id: str) -> str:
+    params = {
+        "infoCode": leaf.get("info_code") or "undefined",
+        "locale": config.MODEL_LOCALE,
+        "container": "main",
+    }
+    auth_token = config.get_auth_token()
+    if auth_token:
+        params["X-Auth-Token"] = auth_token
+
+    return _get_text(
+        f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}",
+        params=params,
+    )
+
+
 def _content_error_message(exc: requests.RequestException) -> str:
     response = exc.response
     if response is None:
@@ -446,7 +462,7 @@ def verify_torque(
         for leaf in leaves_to_check:
             pages_checked += 1
             try:
-                html = _get_text(f"/connect/api/content/raw/{leaf['content_link_id']}")
+                html = _get_raw_content(leaf, engine["model_version_engine_id"])
             except requests.RequestException as exc:
                 if _is_skippable_content_error(exc):
                     skipped_content_pages += 1

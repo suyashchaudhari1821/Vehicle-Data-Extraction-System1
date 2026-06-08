@@ -4,6 +4,7 @@ Provides fast searching and tree structure generation
 """
 
 import os
+import re
 import sqlite3
 import tempfile
 from datetime import datetime
@@ -20,6 +21,15 @@ DB_PATH = Path(os.environ.get("VEHICLE_DB_PATH", Path(__file__).parent / "vehicl
 def _connect(db_path=DB_PATH):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(db_path)
+
+
+def _version_sort_key(version_name):
+    """Sort year/version labels newest first when a year is present."""
+    text = str(version_name or "")
+    year_match = re.search(r"\b(?:19|20)\d{2}\b", text)
+    if year_match:
+        return (0, -int(year_match.group(0)), text.lower())
+    return (1, text.lower())
 
 
 def _create_schema(conn):
@@ -434,10 +444,18 @@ def get_tree_structure(brand_name=None, model_name=None, version_name=None):
         query += " AND v.version_name = ?"
         params.append(version_name)
     
-    query += " ORDER BY b.brand_name, m.model_name, v.version_name, e.engine_name"
+    query += " ORDER BY b.brand_name, m.model_name, e.engine_name"
     
     c.execute(query, params)
-    rows = c.fetchall()
+    rows = sorted(
+        c.fetchall(),
+        key=lambda row: (
+            str(row[0]).lower(),
+            str(row[1]).lower(),
+            _version_sort_key(row[2]),
+            str(row[3]).lower(),
+        ),
+    )
     
     # Build tree structure
     for brand, model, version, engine, engine_code in rows:

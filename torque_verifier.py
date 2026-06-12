@@ -3,8 +3,10 @@
 import re
 import time
 from difflib import SequenceMatcher
+from functools import lru_cache
 from io import StringIO
-from typing import Any, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -15,6 +17,60 @@ import parser
 
 CONFIG_LEVEL = "YEAR_MODEL_ENGINE"
 REQUEST_TIMEOUT = 30
+SHORTCUT_WORKBOOK_PATH = Path(__file__).with_name("Accroname_DT-26_enriched.xlsx")
+MAX_DESCRIPTION_VARIANTS = 64
+MODULE_EXPANSION_MIN_SCORE = 0.85
+TORQUE_CONVERSIONS_TO_NM = {
+    "nm": 1.0,
+    "n_cm": 0.01,
+    "n_mm": 0.001,
+    "ft_lb": 1.3558179483314,
+    "in_lb": 0.1129848290276167,
+    "kgf_m": 9.80665,
+    "kgf_cm": 0.0980665,
+}
+TORQUE_UNIT_PATTERNS = (
+    ("kgf_cm", r"(?:kgf|kg)\s*[- ]?\s*cm\b"),
+    ("kgf_m", r"(?:kgf|kg)\s*[- ]?\s*m\b"),
+    ("ft_lb", r"(?:ft|foot|feet)\.?\s*[- ]?\s*(?:lb|lbs|lbf)\.?"),
+    ("ft_lb", r"(?:lb|lbs|lbf)\.?\s*[- ]?\s*(?:ft|foot|feet)\.?"),
+    ("in_lb", r"(?:in|inch|inches)\.?\s*[- ]?\s*(?:lb|lbs|lbf)\.?"),
+    ("in_lb", r"(?:lb|lbs|lbf)\.?\s*[- ]?\s*(?:in|inch|inches)\.?"),
+    ("n_cm", r"n\s*[.\- ]?\s*cm\b"),
+    ("n_mm", r"n\s*[.\- ]?\s*mm\b"),
+    ("nm", r"n\s*[.\- ]?\s*m\b"),
+)
+NUMBER_PATTERN = r"[-+]?\d+(?:\.\d+)?"
+
+_shortcut_cache_signature: Optional[Tuple[int, int]] = None
+_shortcut_cache: Dict[Tuple[str, ...], Tuple[Dict[str, str], ...]] = {}
+
+# These keep the core torque matcher useful if the external workbook is missing.
+# The workbook remains the primary source and can contain multiple meanings.
+CORE_DESCRIPTION_SHORTCUTS = {
+    "rr": ("rear",),
+    "fr": ("front",),
+    "frt": ("front",),
+    "lh": ("left hand",),
+    "rh": ("right hand",),
+    "lwr": ("lower",),
+    "upr": ("upper",),
+    "ctrl": ("control",),
+    "assy": ("assembly",),
+    "brkt": ("bracket",),
+    "mtg": ("mounting",),
+    "brg": ("bearing",),
+    "cyl": ("cylinder",),
+    "eng": ("engine",),
+    "trans": ("transmission",),
+    "diff": ("differential",),
+    "mt": ("mount", "mounting", "manual transmission"),
+    "asm": ("assembly",),
+    "damp": ("damper",),
+    "plg": ("plug",),
+    "abs": ("absorber",),
+    "em": ("engine mount",),
+}
 
 
 def _headers(accept: str = "application/json, text/javascript, */*; q=0.01") -> Dict[str, str]:
@@ -261,6 +317,156 @@ def _match_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
+def _shortcut_workbook_signature() -> Optional[Tuple[int, int]]:
+    try:
+        stat = SHORTCUT_WORKBOOK_PATH.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _description_shortcuts() -> Dict[Tuple[str, ...], Tuple[Dict[str, str], ...]]:
+    global _shortcut_cache_signature, _shortcut_cache
+
+    signature = _shortcut_workbook_signature()
+    if signature == _shortcut_cache_signature and _shortcut_cache:
+        return _shortcut_cache
+
+    shortcuts: Dict[Tuple[str, ...], List[Dict[str, str]]] = {}
+
+    if signature is not None:
+        workbook = None
+        try:
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(SHORTCUT_WORKBOOK_PATH, read_only=True, data_only=True)
+            worksheet = workbook["List"]
+            rows = worksheet.iter_rows(values_only=True)
+            headers = next(rows, ())
+            category_index = next(
+                (
+                    index
+                    for index, header in enumerate(headers)
+                    if _match_key(header) in {"category", "type"}
+                ),
+                None,
+            )
+            for row in rows:
+                shortcut = row[0] if len(row) > 0 else ""
+                description = row[1] if len(row) > 1 else ""
+                shortcut_key = tuple(_match_key(shortcut).split())
+                description_key = _match_key(description)
+                if not shortcut_key or not description_key:
+                    continue
+                meanings = shortcuts.setdefault(shortcut_key, [])
+                category = (
+                    _match_key(row[category_index])
+                    if category_index is not None and len(row) > category_index
+                    else "mechanical"
+                )
+                if category not in {"module", "mechanical"}:
+                    category = "mechanical"
+                existing = next((item for item in meanings if item["text"] == description_key), None)
+                if existing:
+                    if category == "mechanical":
+                        existing["category"] = category
+                else:
+                    meanings.append({"text": description_key, "category": category})
+        except (OSError, ValueError, KeyError):
+            pass
+        finally:
+            if workbook is not None:
+                workbook.close()
+
+    for shortcut, descriptions in CORE_DESCRIPTION_SHORTCUTS.items():
+        shortcut_key = tuple(_match_key(shortcut).split())
+        meanings = shortcuts.setdefault(shortcut_key, [])
+        for description in descriptions:
+            description_key = _match_key(description)
+            existing = next((item for item in meanings if item["text"] == description_key), None)
+            if existing:
+                existing["category"] = "mechanical"
+            elif description_key:
+                meanings.append({"text": description_key, "category": "mechanical"})
+
+    _shortcut_cache_signature = signature
+    _shortcut_cache = {shortcut: tuple(meanings) for shortcut, meanings in shortcuts.items()}
+    _description_variants_cached.cache_clear()
+    return _shortcut_cache
+
+
+@lru_cache(maxsize=256)
+def _description_variants_cached(
+    value: str,
+    signature: Optional[Tuple[int, int]],
+) -> List[Dict[str, Any]]:
+    original_key = _match_key(value)
+    if not original_key:
+        return [{"text": "", "expansions": []}]
+
+    tokens = original_key.split()
+    shortcuts = _description_shortcuts()
+    variants: List[Dict[str, Any]] = []
+
+    def visit(index: int, output: List[str], expansions: List[Dict[str, Any]]) -> None:
+        if len(variants) >= MAX_DESCRIPTION_VARIANTS:
+            return
+        if index >= len(tokens):
+            variants.append({"text": " ".join(output), "expansions": expansions})
+            return
+
+        matches = [
+            shortcut
+            for shortcut in shortcuts
+            if len(shortcut) <= len(tokens) - index
+            and tuple(tokens[index:index + len(shortcut)]) == shortcut
+        ]
+        if not matches:
+            visit(index + 1, output + [tokens[index]], expansions)
+            return
+
+        shortcut = max(matches, key=len)
+        shortcut_text = " ".join(shortcut)
+        meanings = shortcuts[shortcut]
+        is_ambiguous = len(meanings) > 1
+        for meaning_item in meanings:
+            meaning = meaning_item["text"]
+            visit(
+                index + len(shortcut),
+                output + meaning.split(),
+                expansions
+                + [
+                    {
+                        "shortcut": shortcut_text.upper(),
+                        "meaning": meaning,
+                        "ambiguous": is_ambiguous,
+                        "category": meaning_item["category"],
+                    }
+                ],
+            )
+
+    visit(0, [], [])
+    variants.append({"text": original_key, "expansions": []})
+
+    unique = []
+    seen = set()
+    for variant in variants:
+        marker = (
+            variant["text"],
+            tuple((item["shortcut"], item["meaning"]) for item in variant["expansions"]),
+        )
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(variant)
+    return unique
+
+
+def _description_variants(value: str) -> List[Dict[str, Any]]:
+    _description_shortcuts()
+    return _description_variants_cached(value, _shortcut_cache_signature)
+
+
 def _compact_code(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).upper()
 
@@ -286,25 +492,166 @@ def _text_score(needle: str, haystack: str) -> float:
     return max(ratio, overlap)
 
 
-def _numbers(value: Any) -> List[float]:
-    numbers = []
-    for raw in re.findall(r"\d+(?:\.\d+)?", str(value or "")):
-        try:
-            numbers.append(float(raw))
-        except ValueError:
-            pass
-    return numbers
+def _description_score(needle: str, haystack: str) -> Dict[str, Any]:
+    scored = []
+    for variant in _description_variants(needle):
+        item = variant.copy()
+        item["score"] = _text_score(variant["text"], haystack)
+        if (
+            item["score"] < MODULE_EXPANSION_MIN_SCORE
+            and any(expansion.get("category") == "module" for expansion in item["expansions"])
+        ):
+            continue
+        scored.append(item)
+
+    return max(
+        scored,
+        key=lambda item: (
+            item["score"],
+            bool(item["expansions"]),
+            -len(item["expansions"]),
+        ),
+        default={"text": _match_key(needle), "expansions": [], "score": 0.0},
+    )
+
+
+def _normalized_specification(value: Any) -> str:
+    text = str(value or "").lower()
+    text = text.replace("\u00b7", " ").replace("\u2022", " ")
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _measurement_values_match(
+    target_values: List[float],
+    found_values: List[float],
+) -> bool:
+    if len(target_values) != len(found_values):
+        return False
+    return all(
+        abs(target - found) <= max(0.5, abs(target) * 0.03)
+        for target, found in zip(target_values, found_values)
+    )
+
+
+def _is_alternate_unit_representation(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+    separator: str,
+) -> bool:
+    if previous["type"] != "torque" or current["type"] != "torque":
+        return False
+    if re.search(r"\+|\bthen\b|\bfollowed by\b", separator):
+        return False
+    if previous["unit"] == current["unit"]:
+        return False
+    return _measurement_values_match(previous["values_nm"], current["values_nm"])
+
+
+def _parse_torque_specification(value: Any) -> Dict[str, Any]:
+    text = _normalized_specification(value)
+    angle_pattern = rf"(?P<value>{NUMBER_PATTERN})\s*(?:\u00b0|degrees?|deg)(?![a-z])"
+    stages = []
+    occupied_spans = []
+    for unit, unit_pattern in TORQUE_UNIT_PATTERNS:
+        pattern = re.compile(
+            (
+                rf"(?P<value>{NUMBER_PATTERN})"
+                rf"(?:\s*(?:-|to)\s*(?P<range_end>{NUMBER_PATTERN}))?"
+                rf"\s*(?P<unit>{unit_pattern})"
+            ),
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            raw_values = [float(match.group("value"))]
+            if match.group("range_end") is not None:
+                raw_values.append(float(match.group("range_end")))
+            stages.append(
+                {
+                    "type": "torque",
+                    "values": raw_values,
+                    "values_nm": [
+                        raw_value * TORQUE_CONVERSIONS_TO_NM[unit]
+                        for raw_value in raw_values
+                    ],
+                    "unit": unit,
+                    "span": match.span(),
+                }
+            )
+            occupied_spans.append(match.span())
+
+    for match in re.finditer(angle_pattern, text, re.IGNORECASE):
+        stages.append(
+            {
+                "type": "angle",
+                "value": float(match.group("value")),
+                "span": match.span(),
+            }
+        )
+        occupied_spans.append(match.span())
+
+    stages.sort(key=lambda stage: stage["span"][0])
+    normalized_stages = []
+    for stage in stages:
+        if normalized_stages:
+            previous = normalized_stages[-1]
+            separator = text[previous["span"][1]:stage["span"][0]]
+            if _is_alternate_unit_representation(previous, stage, separator):
+                continue
+        normalized_stages.append(stage)
+
+    bare_numbers = []
+    for match in re.finditer(NUMBER_PATTERN, text):
+        if any(start <= match.start() and match.end() <= end for start, end in occupied_spans):
+            continue
+        bare_numbers.append(float(match.group()))
+
+    bare_numeric_only = bool(re.fullmatch(NUMBER_PATTERN, text))
+    has_unparsed_numeric_content = bool(bare_numbers and not bare_numeric_only)
+    return {
+        "text": text,
+        "stages": normalized_stages,
+        "bare_numbers": bare_numbers,
+        "bare_numeric_only": bare_numeric_only,
+        "has_unparsed_numeric_content": has_unparsed_numeric_content,
+    }
+
+
+def _torque_stages_match(target: Dict[str, Any], found: Dict[str, Any]) -> bool:
+    if target["type"] != found["type"]:
+        return False
+    if target["type"] == "angle":
+        return abs(target["value"] - found["value"]) < 0.01
+    return _measurement_values_match(target["values_nm"], found["values_nm"])
 
 
 def _torque_match(target: str, found: str) -> bool:
-    target_numbers = _numbers(target)
-    found_numbers = _numbers(found)
-    if target_numbers:
-        return any(
-            abs(target_number - found_number) < 0.01
-            for target_number in target_numbers
-            for found_number in found_numbers
+    target_spec = _parse_torque_specification(target)
+    found_spec = _parse_torque_specification(found)
+
+    if target_spec["has_unparsed_numeric_content"] or found_spec["has_unparsed_numeric_content"]:
+        return False
+
+    if target_spec["stages"]:
+        if len(target_spec["stages"]) != len(found_spec["stages"]):
+            return False
+        return all(
+            _torque_stages_match(target_stage, found_stage)
+            for target_stage, found_stage in zip(
+                target_spec["stages"],
+                found_spec["stages"],
+            )
         )
+
+    if target_spec["bare_numeric_only"]:
+        target_number = target_spec["bare_numbers"][0]
+        if found_spec["bare_numeric_only"]:
+            return abs(target_number - found_spec["bare_numbers"][0]) < 0.01
+        if len(found_spec["stages"]) == 1 and found_spec["stages"][0]["type"] == "torque":
+            found_values = found_spec["stages"][0]["values"]
+            return len(found_values) == 1 and abs(target_number - found_values[0]) < 0.01
+        return False
 
     target_key = _match_key(target)
     return bool(target_key and target_key in _match_key(found))
@@ -444,7 +791,7 @@ def _collect_torque_leaves(toc_response: Dict[str, Any]) -> List[Dict[str, str]]
 def _rank_leaves(leaves: List[Dict[str, str]], vsc_name: str) -> List[Dict[str, str]]:
     ranked = []
     for leaf in leaves:
-        score = _text_score(vsc_name, leaf["path"])
+        score = _description_score(vsc_name, leaf["path"])["score"]
         item = leaf.copy()
         item["vsc_score"] = score
         ranked.append(item)
@@ -490,7 +837,12 @@ def _score_torque_row(
     description: str,
     target_torque: str,
 ) -> Dict[str, Any]:
-    description_score = _text_score(description, row["description"]) if description.strip() else 0.0
+    description_result = (
+        _description_score(description, row["description"])
+        if description.strip()
+        else {"text": "", "expansions": [], "score": 0.0}
+    )
+    description_score = description_result["score"]
     torque_matches = _torque_match(target_torque, row["specification"])
     torque_score = 1.0 if torque_matches else _text_score(target_torque, row["specification"])
     vsc_score = float(leaf.get("vsc_score", 0.0))
@@ -503,11 +855,74 @@ def _score_torque_row(
     enriched = row.copy()
     enriched["vsc_score"] = vsc_score
     enriched["description_score"] = description_score
+    enriched["matched_description_input"] = description_result["text"]
+    enriched["shortcut_expansions"] = description_result["expansions"]
     enriched["torque_score"] = torque_score
     enriched["torque_match"] = torque_matches
     enriched["score"] = score
     enriched["confidence"] = round(score * 100, 1)
     return enriched
+
+
+def _ambiguous_expansion_signature(candidate: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (item["shortcut"], item["meaning"])
+            for item in candidate.get("shortcut_expansions", [])
+            if item.get("ambiguous")
+        )
+    )
+
+
+def _find_ambiguous_competitor(
+    best: Dict[str, Any],
+    ranked_candidates: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    best_signature = _ambiguous_expansion_signature(best)
+    if not best_signature:
+        return None
+
+    for candidate in ranked_candidates[1:]:
+        candidate_signature = _ambiguous_expansion_signature(candidate)
+        if not candidate_signature or candidate_signature == best_signature:
+            continue
+        if not candidate.get("torque_match") or candidate.get("description_score", 0.0) < 0.65:
+            continue
+        if best["score"] - candidate["score"] <= 0.03:
+            return candidate
+    return None
+
+
+def _description_has_ambiguous_shortcuts(description: str) -> bool:
+    return any(
+        expansion.get("ambiguous")
+        for variant in _description_variants(description)
+        for expansion in variant.get("expansions", [])
+    )
+
+
+def _initial_torque_leaves(
+    leaves: List[Dict[str, Any]],
+    vsc_name: str,
+) -> List[Dict[str, Any]]:
+    strong_vsc_leaves = [leaf for leaf in leaves if leaf["vsc_score"] >= 0.35]
+    if vsc_name.strip():
+        return strong_vsc_leaves[:12] if strong_vsc_leaves else leaves[:25]
+    return leaves[:35]
+
+
+def _has_decisive_candidate(
+    candidates: List[Dict[str, Any]],
+    description: str,
+) -> bool:
+    if not description.strip() or _description_has_ambiguous_shortcuts(description):
+        return False
+    return any(
+        candidate["description_score"] >= 0.95
+        and candidate["torque_match"]
+        and not _ambiguous_expansion_signature(candidate)
+        for candidate in candidates
+    )
 
 
 def _build_engine_targets(
@@ -587,6 +1002,9 @@ def verify_torque(
     selected_engine = engine_targets[0]["engine"]
     pages_found = 0
     pages_checked = 0
+    readable_pages = 0
+    unreadable_pages = 0
+    content_errors = []
     engine_books_checked = 0
     missing_books = 0
 
@@ -608,29 +1026,44 @@ def verify_torque(
         if not leaves:
             continue
 
-        # VSC name is a ranking hint. Search the best pages first, but keep enough
-        # breadth for cases where Excel wording differs from Service Library TOC.
-        strong_vsc_leaves = [leaf for leaf in leaves if leaf["vsc_score"] >= 0.35]
-        if vsc_name.strip():
-            leaves_to_check = strong_vsc_leaves[:12] if strong_vsc_leaves else leaves[:25]
-        else:
-            leaves_to_check = leaves[:35]
+        initial_leaves = _initial_torque_leaves(leaves, vsc_name)
+        initial_ids = {leaf["content_link_id"] for leaf in initial_leaves}
+        remaining_leaves = [
+            leaf for leaf in leaves if leaf["content_link_id"] not in initial_ids
+        ]
+        target_candidates = []
 
-        for leaf in leaves_to_check:
-            pages_checked += 1
-            html = _get_torque_content(leaf, engine["model_version_engine_id"])
-            for row in _extract_torque_rows(html, leaf):
-                candidate = _score_torque_row(row, leaf, description, target_torque)
-                candidate["vehicle"] = vehicle
-                candidate["engine"] = engine
-                candidate["engine_code_provided"] = engine_code_was_provided
-                all_candidates.append(candidate)
+        def search_pages(pages: List[Dict[str, Any]]) -> None:
+            nonlocal pages_checked, readable_pages, unreadable_pages
+            for leaf in pages:
+                pages_checked += 1
+                try:
+                    html = _get_torque_content(leaf, engine["model_version_engine_id"])
+                except requests.RequestException as exc:
+                    unreadable_pages += 1
+                    if len(content_errors) < 10:
+                        response = exc.response
+                        content_errors.append(
+                            {
+                                "page": leaf["path"],
+                                "content_link_id": leaf["content_link_id"],
+                                "status": response.status_code if response is not None else None,
+                                "error": exc.__class__.__name__,
+                            }
+                        )
+                    continue
+                readable_pages += 1
+                for row in _extract_torque_rows(html, leaf):
+                    candidate = _score_torque_row(row, leaf, description, target_torque)
+                    candidate["vehicle"] = vehicle
+                    candidate["engine"] = engine
+                    candidate["engine_code_provided"] = engine_code_was_provided
+                    target_candidates.append(candidate)
+                    all_candidates.append(candidate)
 
-        if engine_code_was_provided and any(
-            row["description_score"] >= 0.95 and row["torque_match"]
-            for row in all_candidates
-        ):
-            break
+        search_pages(initial_leaves)
+        if remaining_leaves and not _has_decisive_candidate(target_candidates, description):
+            search_pages(remaining_leaves)
 
     if not engine_books_checked:
         return {
@@ -649,28 +1082,39 @@ def verify_torque(
             "candidates": [],
         }
 
-    candidates = sorted(all_candidates, key=lambda row: row["score"], reverse=True)[:5]
+    ranked_candidates = sorted(all_candidates, key=lambda row: row["score"], reverse=True)
+    candidates = ranked_candidates[:5]
     best = candidates[0] if candidates else None
     if not best:
+        incomplete = unreadable_pages > 0
         return {
             "vehicle_match": True,
             "engine_match": engine_code_was_provided,
             "vsc_match": False,
             "description_match": False,
             "torque_match": False,
-            "status": "Not found",
+            "status": "Incomplete" if incomplete else "Not found",
             "confidence": 0,
-            "message": "No matching torque rows were found.",
+            "message": (
+                "No matching torque rows were found in readable pages, but some "
+                "Service Library pages could not be checked."
+                if incomplete
+                else "No matching torque rows were found."
+            ),
             "vehicle": selected_vehicle,
             "engine": selected_engine,
             "engines_checked": len(engine_targets),
             "candidates": [],
             "torque_pages_checked": pages_checked,
             "torque_pages_found": pages_found,
+            "readable_torque_pages": readable_pages,
+            "unreadable_torque_pages": unreadable_pages,
+            "content_errors": content_errors,
         }
 
     description_match = bool(description.strip() and best["description_score"] >= 0.65)
     torque_match = bool(best["torque_match"])
+    ambiguous_competitor = _find_ambiguous_competitor(best, ranked_candidates)
     if torque_match and description_match and (engine_code_was_provided or len(engine_targets) == 1):
         status = "Verified"
     elif torque_match and (description_match or not description.strip()):
@@ -679,6 +1123,10 @@ def verify_torque(
         status = "Needs review"
     else:
         status = "Not found"
+    if ambiguous_competitor and status in {"Verified", "Probable match"}:
+        status = "Needs review"
+    if unreadable_pages and status in {"Verified", "Probable match"}:
+        status = "Needs review"
 
     return {
         "vehicle_match": True,
@@ -687,9 +1135,15 @@ def verify_torque(
         "vsc_match": bool(vsc_name.strip() and best["vsc_score"] >= 0.35),
         "description_match": description_match,
         "torque_match": torque_match,
+        "shortcut_ambiguous": bool(ambiguous_competitor),
+        "ambiguous_competitor": ambiguous_competitor,
         "status": status,
         "confidence": best["confidence"],
-        "message": "Verification completed.",
+        "message": (
+            "Verification completed with unreadable Service Library pages."
+            if unreadable_pages
+            else "Verification completed."
+        ),
         "vehicle": best["vehicle"],
         "engine": best["engine"],
         "engines_checked": len(engine_targets),
@@ -698,4 +1152,7 @@ def verify_torque(
         "candidates": candidates,
         "torque_pages_checked": pages_checked,
         "torque_pages_found": pages_found,
+        "readable_torque_pages": readable_pages,
+        "unreadable_torque_pages": unreadable_pages,
+        "content_errors": content_errors,
     }

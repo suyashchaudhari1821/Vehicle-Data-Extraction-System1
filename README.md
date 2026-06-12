@@ -148,6 +148,20 @@ python extract_by_brand.py
   - Models: `/connect/api/vehicle/models/categorized`
   - Engines: `/connect/api/vehicle/engines`
 
+### Torque Shortcut Matching
+
+Keep `Accroname_DT-26_enriched.xlsx` beside `torque_verifier.py`. The verifier
+loads the `List` sheet and compares all valid shortcut meanings against actual
+Service Library rows. Close matches using different meanings are returned as
+`Needs review` instead of being selected automatically.
+The workbook uses `ACRRONYMS`, `DESCRIPTION`, and `CATEGORY` columns; category
+values are `Mechanical` or `Module`, so sorting rows does not change behavior.
+
+Torque verification compares normalized units, equivalent unit conversions,
+ranges, ordered stages, and repeated angle stages. It checks the highest-ranked torque pages first and
+automatically searches the remaining pages when the first pass is inconclusive.
+Workbook changes are reloaded without restarting the application.
+
 ## Troubleshooting
 
 ### Issue: `ModuleNotFoundError: No module named 'streamlit'`

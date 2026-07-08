@@ -233,6 +233,46 @@ class TorqueTableExtractionTests(unittest.TestCase):
         ])
 
 
+    def test_description_table_with_unnamed_torque_columns_extracts(self):
+        html = """
+        <table>
+            <thead>
+                <tr><th>Description</th><th></th><th></th><th></th><th>Comment</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Front Isolator to Engine Mount Bracket- Bolts</td>
+                    <td>60</td><td></td><td></td><td></td>
+                </tr>
+            </tbody>
+        </table>
+        """
+        rows = torque_verifier._extract_torque_rows(html, {"path": "Engine"})
+
+        self.assertEqual(rows, [
+            {
+                "page": "Engine",
+                "description": "Front Isolator to Engine Mount Bracket- Bolts",
+                "specification": "60 N m",
+                "comment": "",
+            }
+        ])
+
+    def test_description_table_with_torque_column_extracts_as_newton_meters(self):
+        html = """
+        <table>
+            <thead><tr><th>Description</th><th>Torque</th></tr></thead>
+            <tbody>
+                <tr><td>Front Isolator to Engine Mount Bracket- Bolts</td><td>60</td></tr>
+            </tbody>
+        </table>
+        """
+        rows = torque_verifier._extract_torque_rows(html, {"path": "Engine"})
+
+        self.assertEqual(rows[0]["specification"], "60 N m")
+        self.assertTrue(torque_verifier._torque_match("60", rows[0]["specification"]))
+
+
 class ShortcutSafetyTests(unittest.TestCase):
     def test_weak_module_expansion_is_not_forced_on_mechanical_text(self):
         result = torque_verifier._description_score(

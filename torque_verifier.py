@@ -59,6 +59,9 @@ TORQUE_TABLE_UNIT_COLUMNS = {
     "inch pounds": "in_lb",
     "lb in": "in_lb",
     "lbs in": "in_lb",
+    "torque": "nm",
+    "torque nm": "nm",
+    "value": "nm",
 }
 TORQUE_UNIT_DISPLAY = {
     "nm": "N m",
@@ -1198,12 +1201,12 @@ def _unit_columns_from_table(table: pd.DataFrame) -> List[Tuple[Any, str]]:
     return unit_columns
 
 
-def _positional_unit_columns(table: pd.DataFrame) -> List[Tuple[Any, str]]:
+def _positional_unit_columns(table: pd.DataFrame, start_index: int = 1) -> List[Tuple[Any, str]]:
     columns = list(table.columns)
     positional_units = ["nm", "ft_lb", "in_lb"]
     return [
         (columns[index], unit)
-        for index, unit in enumerate(positional_units, start=1)
+        for index, unit in enumerate(positional_units, start=start_index)
         if index < len(columns)
     ]
 
@@ -1289,6 +1292,12 @@ def _extract_torque_rows(content_html: str, leaf: Dict[str, str]) -> List[Dict[s
             unit_columns = _positional_unit_columns(table)
             if len(table.columns) > 4:
                 comment_column = table.columns[4]
+
+        if description_column is not None and specification_column is None and not unit_columns:
+            description_index = list(table.columns).index(description_column)
+            unit_columns = _positional_unit_columns(table, description_index + 1)
+            if comment_column in {column for column, _ in unit_columns}:
+                unit_columns = [item for item in unit_columns if item[0] != comment_column]
 
         if description_column is None or (specification_column is None and not unit_columns):
             continue

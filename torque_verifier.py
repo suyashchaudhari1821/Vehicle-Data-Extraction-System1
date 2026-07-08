@@ -1318,6 +1318,20 @@ def verify_torque(
         ]
         target_candidates = []
 
+        # Per-target debug info to help diagnose skipped pages in production
+        if "search_debug" not in locals():
+            search_debug = []
+        target_debug = {
+            "vehicle": vehicle,
+            "engine": engine,
+            "pages_found": len(leaves),
+            "initial_leaves_count": len(initial_leaves),
+            "remaining_leaves_count": len(remaining_leaves),
+            "initial_checked": 0,
+            "remaining_checked": 0,
+            "decisive_after_initial": False,
+        }
+
         def search_pages(pages: List[Dict[str, Any]]) -> None:
             nonlocal pages_checked, readable_pages, unreadable_pages
             for leaf in pages:
@@ -1346,9 +1360,20 @@ def verify_torque(
                     target_candidates.append(candidate)
                     all_candidates.append(candidate)
 
+        # Search initial leaves first and record how many pages were checked
+        before = pages_checked
         search_pages(initial_leaves)
-        if remaining_leaves and not _has_decisive_candidate(target_candidates, description):
+        target_debug["initial_checked"] = pages_checked - before
+
+        # Decide whether to search remaining leaves
+        decisive = _has_decisive_candidate(target_candidates, description)
+        target_debug["decisive_after_initial"] = bool(decisive)
+        if remaining_leaves and not decisive:
+            before_rem = pages_checked
             search_pages(remaining_leaves)
+            target_debug["remaining_checked"] = pages_checked - before_rem
+
+        search_debug.append(target_debug)
 
     if not engine_books_checked:
         return {
@@ -1395,6 +1420,7 @@ def verify_torque(
             "readable_torque_pages": readable_pages,
             "unreadable_torque_pages": unreadable_pages,
             "content_errors": content_errors,
+            "search_debug": search_debug if 'search_debug' in locals() else [],
         }
 
     description_match = bool(description.strip() and best["description_score"] >= 0.65)
@@ -1440,4 +1466,5 @@ def verify_torque(
         "readable_torque_pages": readable_pages,
         "unreadable_torque_pages": unreadable_pages,
         "content_errors": content_errors,
+        "search_debug": search_debug if 'search_debug' in locals() else [],
     }

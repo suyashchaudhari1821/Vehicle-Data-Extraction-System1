@@ -5,6 +5,7 @@ import time
 from difflib import SequenceMatcher
 from functools import lru_cache
 from io import StringIO
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -41,6 +42,33 @@ TORQUE_UNIT_PATTERNS = (
     ("nm", r"n\s*[.\- ]?\s*m\b"),
 )
 NUMBER_PATTERN = r"[-+]?\d+(?:\.\d+)?"
+TORQUE_TABLE_UNIT_COLUMNS = {
+    "nm": "nm",
+    "n m": "nm",
+    "newton meter": "nm",
+    "newton meters": "nm",
+    "ft lb": "ft_lb",
+    "ft lbs": "ft_lb",
+    "foot pound": "ft_lb",
+    "foot pounds": "ft_lb",
+    "lb ft": "ft_lb",
+    "lbs ft": "ft_lb",
+    "in lb": "in_lb",
+    "in lbs": "in_lb",
+    "inch pound": "in_lb",
+    "inch pounds": "in_lb",
+    "lb in": "in_lb",
+    "lbs in": "in_lb",
+}
+TORQUE_UNIT_DISPLAY = {
+    "nm": "N m",
+    "ft_lb": "ft lb",
+    "in_lb": "in lb",
+    "n_cm": "N cm",
+    "n_mm": "N mm",
+    "kgf_m": "kgf m",
+    "kgf_cm": "kgf cm",
+}
 
 _shortcut_cache_signature: Optional[Tuple[int, int]] = None
 _shortcut_cache: Dict[Tuple[str, ...], Tuple[Dict[str, str], ...]] = {}
@@ -133,7 +161,17 @@ def _get_torque_content(leaf: Dict[str, str], model_version_engine_id: str) -> s
                 params["X-Auth-Token"] = auth_token
 
             try:
-                return _get_text(context_path, params=params)
+                html = _get_text(context_path, params=params)
+                # If the returned shell links to a raw content URL with null placeholders,
+                # replace the nulls with the correct config level and model_version_engine_id
+                if "connect/api/content/raw" in html and "/null/null" in html:
+                    corrected_path = f"/connect/api/content/raw/{leaf['content_link_id']}/{CONFIG_LEVEL}/{model_version_engine_id}"
+                    try:
+                        return _get_text(corrected_path, params={"locale": config.MODEL_LOCALE, "container": "main", "infoCode": info_code or "undefined", "X-Auth-Token": auth_token} if auth_token else {"locale": config.MODEL_LOCALE, "container": "main", "infoCode": info_code or "undefined"})
+                    except requests.HTTPError:
+                        # fall through to return the original html if corrected fetch fails
+                        pass
+                return html
             except requests.HTTPError as exc:
                 last_error = exc
                 response = exc.response
@@ -523,6 +561,13 @@ def _normalized_specification(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _has_explicit_torque_unit(text: str) -> bool:
+    return any(
+        re.search(unit_pattern, text or "", re.IGNORECASE)
+        for _, unit_pattern in TORQUE_UNIT_PATTERNS
+    )
+
+
 def _measurement_values_match(
     target_values: List[float],
     found_values: List[float],
@@ -590,6 +635,27 @@ def _parse_torque_specification(value: Any) -> Dict[str, Any]:
             }
         )
         occupied_spans.append(match.span())
+
+    if not any(stage["type"] == "torque" for stage in stages):
+        shorthand_pattern = re.compile(
+            (
+                rf"(?P<value>{NUMBER_PATTERN})"
+                rf"(?P<separator>\s*(?:\+|plus|then|followed\s+by)\s*)"
+                rf"(?P<angle>{NUMBER_PATTERN})\s*(?:\u00b0|degrees?|deg)(?![a-z])"
+            ),
+            re.IGNORECASE,
+        )
+        for match in shorthand_pattern.finditer(text):
+            stages.append(
+                {
+                    "type": "torque",
+                    "values": [float(match.group("value"))],
+                    "values_nm": [float(match.group("value"))],
+                    "unit": "nm",
+                    "span": match.span("value"),
+                }
+            )
+            occupied_spans.append(match.span("value"))
 
     stages.sort(key=lambda stage: stage["span"][0])
     normalized_stages = []
@@ -1083,34 +1149,172 @@ def _rank_leaves(leaves: List[Dict[str, str]], vsc_name: str) -> List[Dict[str, 
     return sorted(ranked, key=lambda item: item["vsc_score"], reverse=True)
 
 
+def _column_key(column: Any) -> str:
+    if isinstance(column, tuple):
+        parts = []
+        for part in column:
+            text = _clean_text(part)
+            if not text or text.lower() == "nan" or text.lower().startswith("unnamed:"):
+                continue
+            parts.append(text)
+        return _match_key(" ".join(parts))
+    return _match_key(column)
+
+
+def _is_empty_spec_value(value: Any) -> bool:
+    text = _clean_text(value)
+    key = _match_key(text)
+    return not text or key in {"nan", "none"} or bool(re.fullmatch(r"[-\u2013\u2014]+", text))
+
+
+def _format_unit_specification(value: Any, unit: str) -> str:
+    text = _clean_text(value)
+    if re.fullmatch(r"[-+]?\d+\.0", text):
+        text = text[:-2]
+    if not text or _has_explicit_torque_unit(text):
+        return text
+
+    unit_label = TORQUE_UNIT_DISPLAY[unit]
+    staged = re.match(
+        rf"^(?P<value>{NUMBER_PATTERN})(?P<tail>\s*(?:\+|plus|then|followed\s+by)\s*.*)$",
+        text,
+        re.IGNORECASE,
+    )
+    if staged:
+        return f"{staged.group('value')} {unit_label}{staged.group('tail')}"
+    return f"{text} {unit_label}"
+
+
+def _unit_column_for_key(column_key: str) -> Optional[str]:
+    return TORQUE_TABLE_UNIT_COLUMNS.get(column_key)
+
+
+def _unit_columns_from_table(table: pd.DataFrame) -> List[Tuple[Any, str]]:
+    unit_columns = []
+    for column in table.columns:
+        unit = _unit_column_for_key(_column_key(column))
+        if unit:
+            unit_columns.append((column, unit))
+    return unit_columns
+
+
+def _positional_unit_columns(table: pd.DataFrame) -> List[Tuple[Any, str]]:
+    columns = list(table.columns)
+    positional_units = ["nm", "ft_lb", "in_lb"]
+    return [
+        (columns[index], unit)
+        for index, unit in enumerate(positional_units, start=1)
+        if index < len(columns)
+    ]
+
+
+def _row_unit_specification(row: pd.Series, unit_columns: List[Tuple[Any, str]]) -> str:
+    parts = []
+    for column, unit in unit_columns:
+        value = row.get(column)
+        if _is_empty_spec_value(value):
+            continue
+        parts.append(_format_unit_specification(value, unit))
+    return " / ".join(parts)
+
+
 def _extract_torque_rows(content_html: str, leaf: Dict[str, str]) -> List[Dict[str, str]]:
     rows = []
     try:
         tables = pd.read_html(StringIO(content_html))
     except ValueError:
-        return rows
+        tables = []
+    # If pandas found no tables in the provided HTML, try fallback fetches
+    if not tables:
+        # Look for direct raw content links in the shell HTML and try to fetch them
+        hrefs = re.findall(r'href=["\']([^"\']*connect/api/content/raw/[^"\']*)', content_html, flags=re.I)
+        for href in hrefs:
+            href = href.replace('&amp;', '&')
+            parsed = urlparse(href)
+            if parsed.path:
+                path = parsed.path
+            else:
+                path = href
+            params = {k: v[0] for k, v in parse_qs(parsed.query).items()} if parsed.query else {}
+            # Ensure auth token present in params if available
+            auth_token = config.get_auth_token()
+            if auth_token and 'X-Auth-Token' not in params:
+                params['X-Auth-Token'] = auth_token
+            try:
+                raw_html = _get_text(path, params=params)
+            except requests.RequestException:
+                raw_html = None
+            if raw_html:
+                try:
+                    tables = pd.read_html(StringIO(raw_html))
+                except ValueError:
+                    tables = []
+                if tables:
+                    content_html = raw_html
+                    break
+
+    # If still no tables, try plugin iframe endpoint as a last resort
+    if not tables:
+        try:
+            metadata = _get_content_metadata(leaf, '')
+        except Exception:
+            metadata = {}
+        try:
+            iframe_params = _plugin_iframe_params(leaf, '', metadata)
+            iframe_html = _get_text('/web/secure/api/plugin/iframe', params=iframe_params)
+            try:
+                tables = pd.read_html(StringIO(iframe_html))
+                content_html = iframe_html
+            except ValueError:
+                tables = []
+        except Exception:
+            tables = []
 
     for table in tables:
-        normalized_columns = [_match_key(column).upper() for column in table.columns]
-        if "DESCRIPTION" not in normalized_columns or "SPECIFICATION" not in normalized_columns:
-            continue
-        description_column = table.columns[normalized_columns.index("DESCRIPTION")]
-        specification_column = table.columns[normalized_columns.index("SPECIFICATION")]
+        normalized_columns = [_column_key(column).upper() for column in table.columns]
+        description_column = None
+        specification_column = None
         comment_column = None
+
+        if "DESCRIPTION" in normalized_columns:
+            description_column = table.columns[normalized_columns.index("DESCRIPTION")]
+        if "SPECIFICATION" in normalized_columns:
+            specification_column = table.columns[normalized_columns.index("SPECIFICATION")]
         if "COMMENT" in normalized_columns:
             comment_column = table.columns[normalized_columns.index("COMMENT")]
 
+        unit_columns = _unit_columns_from_table(table)
+        if description_column is None and specification_column is None and not unit_columns and len(table.columns) >= 2:
+            description_column = table.columns[0]
+            unit_columns = _positional_unit_columns(table)
+            if len(table.columns) > 4:
+                comment_column = table.columns[4]
+
+        if description_column is None or (specification_column is None and not unit_columns):
+            continue
+
         for _, row in table.iterrows():
             description = _clean_text(row.get(description_column))
-            specification = _clean_text(row.get(specification_column))
-            if not description or description.lower() == "nan" or not specification or specification.lower() == "nan":
+            if not description or description.lower() == "nan" or _column_key(description) == "description":
                 continue
+
+            if specification_column is not None:
+                specification = _clean_text(row.get(specification_column))
+            else:
+                specification = _row_unit_specification(row, unit_columns)
+            if _is_empty_spec_value(specification):
+                continue
+
             rows.append(
                 {
                     "page": leaf["path"],
                     "description": description,
                     "specification": specification,
-                    "comment": _clean_text(row.get(comment_column)) if comment_column is not None else "",
+                    "comment": (
+                        ""
+                        if comment_column is None or _is_empty_spec_value(row.get(comment_column))
+                        else _clean_text(row.get(comment_column))
+                    ),
                 }
             )
     return rows

@@ -176,6 +176,63 @@ class TorqueSpecificationTests(unittest.TestCase):
         self.assertFalse(torque_verifier._torque_match("18 lb", "18 N m"))
 
 
+    def test_plus_angle_shorthand_matches_as_newton_meter_stage(self):
+        self.assertTrue(torque_verifier._torque_match("30 Plus 45\u00b0", "30 Plus 45\u00b0"))
+        self.assertTrue(torque_verifier._torque_match("30 Plus 45\u00b0", "30 N m + 45 degrees"))
+        self.assertFalse(torque_verifier._torque_match("30 Plus 45\u00b0", "30 N m + 90 degrees"))
+
+
+class TorqueTableExtractionTests(unittest.TestCase):
+    def test_unit_column_table_extracts_description_and_specification(self):
+        html = """
+        <table>
+            <thead>
+                <tr>
+                    <th>Description</th><th>N.m</th><th>Ft. Lbs.</th><th>In. Lbs.</th><th>Comment</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Electric Park Brake (EPB) Caliper to Knuckle Bolts - Rear (Quadrifoglio)</td>
+                    <td>30 Plus 45\u00b0</td><td></td><td>-</td><td>* New Fastener</td>
+                </tr>
+                <tr>
+                    <td>Brake Tube to Brake Caliper Nut - Front</td>
+                    <td>16</td><td>12</td><td>-</td><td></td>
+                </tr>
+            </tbody>
+        </table>
+        """
+        rows = torque_verifier._extract_torque_rows(html, {"path": "Brakes"})
+
+        self.assertEqual(rows[0]["description"], "Electric Park Brake (EPB) Caliper to Knuckle Bolts - Rear (Quadrifoglio)")
+        self.assertEqual(rows[0]["specification"], "30 N m Plus 45\u00b0")
+        self.assertEqual(rows[0]["comment"], "* New Fastener")
+        self.assertEqual(rows[1]["specification"], "16 N m / 12 ft lb")
+
+    def test_positional_unit_table_extracts_when_headers_are_missing(self):
+        html = """
+        <table>
+            <tbody>
+                <tr><td>Description</td><td>N.m</td><td>Ft. Lbs.</td><td>In. Lbs.</td><td>Comment</td></tr>
+                <tr>
+                    <td>Brake Tube to ICU Nuts</td><td>16</td><td>12</td><td>-</td><td></td>
+                </tr>
+            </tbody>
+        </table>
+        """
+        rows = torque_verifier._extract_torque_rows(html, {"path": "Brakes"})
+
+        self.assertEqual(rows, [
+            {
+                "page": "Brakes",
+                "description": "Brake Tube to ICU Nuts",
+                "specification": "16 N m / 12 ft lb",
+                "comment": "",
+            }
+        ])
+
+
 class ShortcutSafetyTests(unittest.TestCase):
     def test_weak_module_expansion_is_not_forced_on_mechanical_text(self):
         result = torque_verifier._description_score(

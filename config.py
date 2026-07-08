@@ -77,6 +77,10 @@ BRAND_CODES = {
     'EAGLE': 'EAGLE',
     'PLYMOUTH': 'PLYMOUTH',
     'VOLKSWAGEN': 'VW',
+    # Regional/International Brands
+    'GA': 'GA',
+    'GU': 'GU',
+    'WD': 'WD',
 }
 
 # Some API model names differ from the public website name in specific markets.

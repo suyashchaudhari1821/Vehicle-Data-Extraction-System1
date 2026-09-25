@@ -57,7 +57,8 @@ def get_model_request_params(brand_code: str) -> Dict[str, str]:
         "_": cache_buster,
     }
 
-# Brand codes for API - ALL brands (current, legacy, international)
+# Brand codes accepted by the models API. Vehicle-family codes such as GA, GU,
+# and WD belong in torque_verifier mappings, not in this brand refresh list.
 BRAND_CODES = {
     # Current Brands
     'ABARTH': 'ABARTH',
@@ -77,10 +78,6 @@ BRAND_CODES = {
     'EAGLE': 'EAGLE',
     'PLYMOUTH': 'PLYMOUTH',
     'VOLKSWAGEN': 'VW',
-    # Regional/International Brands
-    'GA': 'GA',
-    'GU': 'GU',
-    'WD': 'WD',
 }
 
 # Some API model names differ from the public website name in specific markets.
@@ -205,10 +202,10 @@ def refresh_auth_token() -> bool:
         
         if new_token and isinstance(new_token, str):
             set_auth_token(new_token)
-            print(f"[TOKEN REFRESH] New token obtained: {new_token[:20]}...")
+            print("[TOKEN REFRESH] New token obtained successfully")
             return True
         else:
-            print(f"[TOKEN REFRESH] Failed: Invalid token format - {token_data}")
+            print("[TOKEN REFRESH] Failed: invalid token response format")
             return False
             
     except Exception as e:

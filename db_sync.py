@@ -10,9 +10,10 @@ import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -47,7 +48,11 @@ def _parse_refresh_time(value: Optional[str]) -> Optional[datetime]:
 
     value = value.strip()
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            # Older database files stored the Streamlit server's naive UTC time.
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
 
@@ -85,7 +90,9 @@ def _is_valid_database(db_path: Path) -> bool:
 def _get_config() -> dict:
     token = _setting("GITHUB_TOKEN")
     repo = _setting("GITHUB_REPO") or _setting("GITHUB_REPOSITORY")
-    branch = _setting("GITHUB_BRANCH")
+    # Keep mutable data commits off the deployment branch. Updating main after
+    # every refresh causes Streamlit Cloud to redeploy just as the build ends.
+    branch = _setting("GITHUB_BRANCH", "database-data")
     db_path = _setting("GITHUB_DB_PATH", "vehicle_data.db")
     enabled_text = _setting("GITHUB_DB_SYNC_ENABLED")
 
@@ -112,6 +119,36 @@ def _default_branch(repo: str, token: str) -> str:
     )
     response.raise_for_status()
     return response.json().get("default_branch") or "main"
+
+
+def _ensure_branch(repo: str, branch: str, token: str) -> None:
+    """Create the dedicated data branch from the default branch when needed."""
+    encoded_branch = quote(branch, safe="/")
+    ref_url = f"https://api.github.com/repos/{repo}/git/ref/heads/{encoded_branch}"
+    response = requests.get(ref_url, headers=_headers(token), timeout=30)
+    if response.ok:
+        return
+    if response.status_code != 404:
+        response.raise_for_status()
+
+    default_branch = _default_branch(repo, token)
+    encoded_default = quote(default_branch, safe="/")
+    source = requests.get(
+        f"https://api.github.com/repos/{repo}/git/ref/heads/{encoded_default}",
+        headers=_headers(token),
+        timeout=30,
+    )
+    source.raise_for_status()
+    source_sha = source.json()["object"]["sha"]
+    created = requests.post(
+        f"https://api.github.com/repos/{repo}/git/refs",
+        headers=_headers(token),
+        json={"ref": f"refs/heads/{branch}", "sha": source_sha},
+        timeout=30,
+    )
+    # Another app session may have created it concurrently.
+    if created.status_code not in (201, 422):
+        created.raise_for_status()
 
 
 def _content_url(repo: str, db_path: str) -> str:
@@ -142,7 +179,7 @@ def download_database_if_newer(local_path: Path) -> SyncResult:
         return SyncResult(False, "Set GITHUB_TOKEN and GITHUB_REPO to enable DB sync.")
 
     try:
-        branch = config["branch"] or _default_branch(config["repo"], config["token"])
+        branch = config["branch"]
         remote = _get_remote_file(config["repo"], config["db_path"], branch, config["token"])
         if not remote:
             return SyncResult(True, "No database found in GitHub sync yet.")
@@ -187,7 +224,8 @@ def upload_database(local_path: Path) -> SyncResult:
         return SyncResult(False, "Local database is missing or invalid; upload skipped.")
 
     try:
-        branch = config["branch"] or _default_branch(config["repo"], config["token"])
+        branch = config["branch"]
+        _ensure_branch(config["repo"], branch, config["token"])
         remote = _get_remote_file(config["repo"], config["db_path"], branch, config["token"])
         refresh_time = _read_refresh_time(local_path)
         refresh_label = refresh_time.isoformat(sep=" ") if refresh_time else "latest"

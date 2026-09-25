@@ -104,14 +104,19 @@ Streamlit Secrets:
 GITHUB_DB_SYNC_ENABLED = "true"
 GITHUB_TOKEN = "github_pat_your_token_here"
 GITHUB_REPO = "suyashchaudhari1821/Vehicle-Data-Extraction-System1"
-GITHUB_BRANCH = "main"
+GITHUB_BRANCH = "database-data"
 GITHUB_DB_PATH = "vehicle_data.db"
 ```
 
 Use a GitHub fine-grained personal access token with **Contents: Read and
 write** access to this repository. After this is configured, the app downloads
 the latest database from GitHub on startup and uploads the database back to
-GitHub after every successful **Build/Refresh Database**.
+GitHub after every successful **Build/Refresh Database**. A refresh is only
+considered successful when every configured brand returns model data; otherwise
+the existing database is kept unchanged and the failed brand is reported. Keep
+`GITHUB_BRANCH` separate from the Streamlit deployment branch so a database
+save does not restart the running app. The app creates `database-data` from the
+repository's default branch on the first successful upload if it does not exist.
 
 ### Option 2: Run Batch Scripts
 

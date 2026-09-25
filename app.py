@@ -11,6 +11,8 @@ from collections import defaultdict
 import io
 import os
 from pathlib import Path
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import database
 import db_sync
 import parser
@@ -95,6 +97,19 @@ def redact_url_secrets(message):
     return re.sub(r"https?://[^\s]+", replace_url, str(message))
 
 
+def format_refresh_time(value):
+    """Display database UTC timestamps unambiguously in India time."""
+    if not value or value == "Never":
+        return "Never"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
+    except (TypeError, ValueError):
+        return str(value)
+
+
 require_login()
 
 # Pull the latest persisted DB before initializing the schema. This keeps
@@ -155,17 +170,21 @@ with st.sidebar:
         )
         
         st.markdown("**Step 2: Cookies**")
-        cookie_input = st.text_area(
+        cookie_input = st.text_input(
             "Paste your cookies here:",
             value="",
-            height=80,
+            type="password",
             placeholder="Paste the entire cookie string from DevTools...",
             label_visibility="collapsed"
+        )
+        st.caption(
+            "Credentials entered here remain only for this running app session. "
+            "Use Streamlit Secrets for persistence across restarts."
         )
         
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Save Credentials", use_container_width=True):
+            if st.button("Use Credentials This Session", use_container_width=True):
                 saved = False
                 if token_input.strip():
                     config.set_auth_token(token_input.strip())
@@ -228,11 +247,18 @@ with st.sidebar:
     
     # Database management
     st.markdown("### Model Database")
+
+    build_notice = st.session_state.pop("database_build_notice", None)
+    if build_notice:
+        st.success(build_notice)
+    sync_warning = st.session_state.pop("database_sync_warning", None)
+    if sync_warning:
+        st.warning(sync_warning)
     
     db_exists = database.is_database_exists()
     if db_exists:
         db_summary = database.get_database_summary()
-        st.info(f"Last updated: {db_summary['last_refresh']}")
+        st.info(f"Last updated: {format_refresh_time(db_summary['last_refresh'])}")
         st.caption(
             f"Loaded {db_summary['models']} models, "
             f"{db_summary['versions']} versions, "
@@ -276,32 +302,13 @@ with st.sidebar:
                 if success:
                     sync_result = db_sync.upload_database(database.DB_PATH)
                     st.session_state.db_sync_status = sync_result.message
-                    st.success(message)
-                    if sync_result.ok:
-                        st.success(sync_result.message)
-                    else:
-                        st.warning(sync_result.message)
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    st.error(f"Failed: {message}")
-
-    if st.button(
-        "Quick Update RAM / DT 1500",
-        use_container_width=True,
-        help="Refresh only RAM data. This is much faster than rebuilding all 19 brands.",
-    ):
-        if not cookies_valid:
-            st.error("Please update cookies first!")
-        else:
-            with st.spinner("Updating RAM models and engines..."):
-                success, message = database.regenerate_database(["RAM"])
-                if success:
-                    sync_result = db_sync.upload_database(database.DB_PATH)
-                    st.session_state.db_sync_status = sync_result.message
-                    st.success(message)
+                    st.session_state.database_build_notice = (
+                        f"{message} {sync_result.message}"
+                        if sync_result.ok
+                        else message
+                    )
                     if not sync_result.ok:
-                        st.warning(sync_result.message)
+                        st.session_state.database_sync_warning = sync_result.message
                     st.cache_data.clear()
                     st.rerun()
                 else:

@@ -5,10 +5,9 @@ Provides fast searching and tree structure generation
 
 import os
 import re
-import shutil
 import sqlite3
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import streamlit as st
 from api_client import APIClient
@@ -151,8 +150,8 @@ def get_database_summary():
     return summary
 
 
-def regenerate_database(brand_names=None):
-    """Refresh all or selected brands and atomically replace the database."""
+def regenerate_database():
+    """Refresh every configured brand and atomically replace the database."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     temp_file = tempfile.NamedTemporaryFile(
         prefix=f"{DB_PATH.stem}_",
@@ -163,11 +162,6 @@ def regenerate_database(brand_names=None):
     temp_path = Path(temp_file.name)
     temp_file.close()
 
-    selected_brands = set(brand_names or [])
-    is_partial_refresh = bool(selected_brands) and DB_PATH.exists()
-    if is_partial_refresh:
-        shutil.copy2(DB_PATH, temp_path)
-
     conn = _connect(temp_path)
     _create_schema(conn)
     c = conn.cursor()
@@ -177,12 +171,9 @@ def regenerate_database(brand_names=None):
 
     try:
         with APIClient(config.get_cookies()) as client:
-            brand_items = [
-                item for item in config.BRAND_CODES.items()
-                if not selected_brands or item[0] in selected_brands
-            ]
+            brand_items = list(config.BRAND_CODES.items())
             if not brand_items:
-                raise ValueError("No valid brands were selected for refresh")
+                raise ValueError("No brands are configured for refresh")
             engine_issue_count = 0
             skipped_brands = []
             successful_brands = 0
@@ -230,20 +221,6 @@ def regenerate_database(brand_names=None):
                         model_name = config.get_model_display_name(brand_code, api_model_name)
 
                         model_id = None
-                        if is_partial_refresh:
-                            c.execute(
-                                "SELECT model_id FROM models WHERE brand_id=? AND "
-                                "(api_model_name=? OR (api_model_name IS NULL AND model_name=?)) LIMIT 1",
-                                (brand_id, api_model_name, model_name),
-                            )
-                            existing_model = c.fetchone()
-                            if existing_model:
-                                model_id = existing_model[0]
-                                c.execute(
-                                    "UPDATE models SET model_name=?, api_model_name=? WHERE model_id=?",
-                                    (model_name, api_model_name, model_id),
-                                )
-
                         if model_id is None:
                             c.execute(
                                 "INSERT INTO models (brand_id, model_name, api_model_name) VALUES (?, ?, ?)",
@@ -261,19 +238,6 @@ def regenerate_database(brand_names=None):
                                 api_model_name,
                                 api_version_name
                             )
-
-                            if is_partial_refresh:
-                                c.execute(
-                                    "SELECT version_id FROM versions WHERE model_id=? AND version_id_api=? LIMIT 1",
-                                    (model_id, version_id_api),
-                                )
-                                existing_version = c.fetchone()
-                                if existing_version:
-                                    c.execute(
-                                        "UPDATE versions SET version_name=? WHERE version_id=?",
-                                        (version_name, existing_version[0]),
-                                    )
-                                    continue
 
                             c.execute(
                                 "INSERT INTO versions (model_id, version_name, version_id_api) VALUES (?, ?, ?)",
@@ -308,12 +272,9 @@ def regenerate_database(brand_names=None):
                             except Exception as e:
                                 if '401' in str(e):
                                     raise
-                                engine_issue_count += 1
-                                c.execute(
-                                    "INSERT INTO engines (version_id, engine_name, engine_code, engine_status) VALUES (?, ?, ?, ?)",
-                                    (version_id, 'N/A', '', f'FETCH_FAILED: {e}')
-                                )
-                                engine_count += 1
+                                raise RuntimeError(
+                                    f"engine lookup failed for {model_name} / {version_name}: {e}"
+                                ) from e
                     c.execute("RELEASE SAVEPOINT current_brand")
                     conn.commit()
                     successful_brands += 1
@@ -334,13 +295,16 @@ def regenerate_database(brand_names=None):
                         return False, "Cookies expired! Please update them in Settings."
                     skipped_brands.append(f"{brand_name}: {e}")
 
-            if is_partial_refresh and successful_brands != len(brand_items):
+            if successful_brands != len(brand_items):
                 progress_bar.empty()
                 status_text.empty()
                 conn.close()
                 temp_path.unlink(missing_ok=True)
-                reason = "; ".join(skipped_brands[:3]) or "No data returned from API"
-                return False, f"Selected brand was not updated; the existing database is unchanged. {reason}"
+                reason = "; ".join(skipped_brands) or "No data returned from API"
+                return False, (
+                    f"Full refresh stopped: {successful_brands}/{len(brand_items)} brands succeeded. "
+                    f"The existing database was not changed. Failed brands: {reason}"
+                )
 
             if model_count == 0 or version_count == 0:
                 progress_bar.empty()
@@ -353,7 +317,7 @@ def regenerate_database(brand_names=None):
         # Update refresh time
         c.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-            ('last_refresh', str(datetime.now()))
+            ('last_refresh', datetime.now(timezone.utc).isoformat())
         )
         c.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
@@ -370,8 +334,6 @@ def regenerate_database(brand_names=None):
         message = f"Database regenerated successfully: {model_count} models, {version_count} versions, {engine_count} engines."
         if engine_issue_count:
             message += f" {engine_issue_count} versions did not return a real engine; check the model tree/export status."
-        if skipped_brands:
-            message += f" Skipped {len(skipped_brands)} brand(s): {'; '.join(skipped_brands[:3])}"
         return True, message
     
     except Exception as e:

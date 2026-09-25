@@ -179,17 +179,21 @@ def regenerate_database():
             engine_count = 0
 
             for idx, (brand_name, brand_code) in enumerate(brand_items):
+                counts_before_brand = (model_count, version_count, engine_count, engine_issue_count)
                 try:
                     progress = (idx + 1) / len(brand_items)
                     progress_bar.progress(progress)
-                    status_text.text(f"Processing: {idx + 1}/{len(brand_items)} brands...")
+                    status_text.text(
+                        f"Processing {brand_name}: {idx + 1}/{len(brand_items)} brands "
+                        f"({model_count} models, {version_count} versions)"
+                    )
+                    c.execute("SAVEPOINT current_brand")
                     
                     # Insert brand
                     c.execute(
                         "INSERT OR IGNORE INTO brands (brand_name, brand_code) VALUES (?, ?)",
                         (brand_name, brand_code)
                     )
-                    conn.commit()
                     
                     # Get brand_id
                     c.execute("SELECT brand_id FROM brands WHERE brand_name=?", (brand_name,))
@@ -204,6 +208,8 @@ def regenerate_database():
                     models = parser.extract_models(response)
                     if not models:
                         skipped_brands.append(f"{brand_name}: no models returned")
+                        c.execute("RELEASE SAVEPOINT current_brand")
+                        conn.commit()
                         continue
                     
                     # Insert models and their versions/engines
@@ -215,7 +221,6 @@ def regenerate_database():
                             "INSERT INTO models (brand_id, model_name, api_model_name) VALUES (?, ?, ?)",
                             (brand_id, model_name, api_model_name)
                         )
-                        conn.commit()
                         model_count += 1
                         
                         c.execute("SELECT last_insert_rowid()")
@@ -235,7 +240,6 @@ def regenerate_database():
                                 "INSERT INTO versions (model_id, version_name, version_id_api) VALUES (?, ?, ?)",
                                 (model_id, version_name, version_id_api)
                             )
-                            conn.commit()
                             version_count += 1
                             
                             c.execute("SELECT last_insert_rowid()")
@@ -264,17 +268,26 @@ def regenerate_database():
                                         )
                                     )
                                     engine_count += 1
-                                conn.commit()
                             except Exception as e:
+                                if '401' in str(e):
+                                    raise
                                 engine_issue_count += 1
                                 c.execute(
                                     "INSERT INTO engines (version_id, engine_name, engine_code, engine_status) VALUES (?, ?, ?, ?)",
                                     (version_id, 'N/A', '', f'FETCH_FAILED: {e}')
                                 )
                                 engine_count += 1
-                                conn.commit()
+                    c.execute("RELEASE SAVEPOINT current_brand")
+                    conn.commit()
                 
                 except Exception as e:
+                    model_count, version_count, engine_count, engine_issue_count = counts_before_brand
+                    try:
+                        c.execute("ROLLBACK TO SAVEPOINT current_brand")
+                        c.execute("RELEASE SAVEPOINT current_brand")
+                        conn.commit()
+                    except sqlite3.Error:
+                        conn.rollback()
                     if '401' in str(e):
                         progress_bar.empty()
                         status_text.empty()

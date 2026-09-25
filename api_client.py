@@ -24,6 +24,7 @@ class APIClient:
         """
         self.session = requests.Session()
         self.cookies = cookies
+        self._auth_initialized = False
         self._setup_session()
     
     def _setup_session(self) -> None:
@@ -70,13 +71,16 @@ class APIClient:
         retries = 0
         while retries < config.MAX_RETRIES:
             try:
-                # Refresh token before each request to ensure it's valid
-                config.refresh_auth_token()
+                # A database refresh can make thousands of API calls. Refreshing
+                # the token before every call doubles the network traffic and can
+                # make long builds time out. Use the supplied token when present,
+                # then refresh only when it is missing or the server returns 401.
+                if not self._auth_initialized:
+                    self._auth_initialized = True
+                    if not config.get_auth_token():
+                        config.refresh_auth_token()
                 
                 headers = self._prepare_headers()
-                token = headers.get("X-Auth-Token", "NOT SET")
-                print(f"[DEBUG] Using Token: {token[:30]}...")
-                
                 time.sleep(config.REQUEST_DELAY)
                 response = self.session.get(
                     endpoint,
@@ -84,6 +88,15 @@ class APIClient:
                     params=params,
                     timeout=30
                 )
+
+                if response.status_code == 401:
+                    if not config.refresh_auth_token():
+                        raise Exception("401 Unauthorized: cookies are expired or invalid")
+                    retries += 1
+                    if retries >= config.MAX_RETRIES:
+                        raise Exception("401 Unauthorized after refreshing authentication")
+                    continue
+
                 response.raise_for_status()
                 return response.json()
             

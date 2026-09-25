@@ -4,10 +4,40 @@ from unittest.mock import patch
 
 import pandas as pd
 import requests
+import parser
 import torque_verifier
 
 
 TEST_TMP = Path(__file__).resolve().parent / "tmp"
+
+
+class VehicleVersionParsingTests(unittest.TestCase):
+    def test_numeric_model_year_is_used_when_version_name_is_absent(self):
+        self.assertEqual(parser.get_version_name({"modelYear": 2027}), "2027")
+
+    def test_dt_2027_numeric_model_year_is_found(self):
+        response = {
+            "categories": [
+                {
+                    "displayName": "DT - 1500 Pickup",
+                    "modelVersions": [
+                        {
+                            "modelYear": 2027,
+                            "modelVersionId": "dt-2027",
+                            "modelCode": "DT",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with patch.object(torque_verifier, "_get_json", return_value=response):
+            matches = torque_verifier._find_vehicle_versions(2027, "DT")
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["brand"], "RAM")
+        self.assertEqual(matches[0]["version"], "2027")
+        self.assertEqual(matches[0]["model_version_id"], "dt-2027")
 
 
 class DescriptionShortcutTests(unittest.TestCase):

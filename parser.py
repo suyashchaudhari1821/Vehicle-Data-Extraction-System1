@@ -14,6 +14,7 @@ MODEL_NAME_FIELDS = (
 
 VERSION_LIST_FIELDS = ("modelVersions", "versions", "modelVersionList")
 VERSION_NAME_FIELDS = ("versionName", "displayName", "name", "label")
+VERSION_YEAR_FIELDS = ("modelYear", "year", "model_year")
 VERSION_ID_FIELDS = ("modelVersionId", "versionId", "id")
 ENGINE_NAME_FIELDS = (
     "engine",
@@ -96,7 +97,21 @@ def get_version_id(version: Dict[str, Any]) -> str:
 
 def get_version_name(version: Dict[str, Any]) -> str:
     """Return the best display name for a version object."""
-    return _first_text(version, VERSION_NAME_FIELDS, "Unknown")
+    name = _first_text(version, VERSION_NAME_FIELDS)
+    if name:
+        return name
+
+    # Recent model years are sometimes returned as a numeric ``modelYear``
+    # instead of a string ``versionName``.  Converting only explicit year
+    # fields avoids treating unrelated numeric values as a version label.
+    for field in VERSION_YEAR_FIELDS:
+        value = version.get(field)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            normalized = str(value).strip()
+            if normalized:
+                return normalized
+
+    return "Unknown"
 
 
 def extract_engine_names(response: Dict[str, Any]) -> List[str]:

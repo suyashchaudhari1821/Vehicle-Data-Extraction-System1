@@ -285,6 +285,27 @@ with st.sidebar:
                     st.rerun()
                 else:
                     st.error(f"Failed: {message}")
+
+    if st.button(
+        "Quick Update RAM / DT 1500",
+        use_container_width=True,
+        help="Refresh only RAM data. This is much faster than rebuilding all 19 brands.",
+    ):
+        if not cookies_valid:
+            st.error("Please update cookies first!")
+        else:
+            with st.spinner("Updating RAM models and engines..."):
+                success, message = database.regenerate_database(["RAM"])
+                if success:
+                    sync_result = db_sync.upload_database(database.DB_PATH)
+                    st.session_state.db_sync_status = sync_result.message
+                    st.success(message)
+                    if not sync_result.ok:
+                        st.warning(sync_result.message)
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(f"Failed: {message}")
     
     st.divider()
 

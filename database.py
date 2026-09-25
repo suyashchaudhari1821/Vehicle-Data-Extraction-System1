@@ -5,6 +5,7 @@ Provides fast searching and tree structure generation
 
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 from datetime import datetime
@@ -150,8 +151,8 @@ def get_database_summary():
     return summary
 
 
-def regenerate_database():
-    """Regenerate the entire database from the API and atomically replace it."""
+def regenerate_database(brand_names=None):
+    """Refresh all or selected brands and atomically replace the database."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     temp_file = tempfile.NamedTemporaryFile(
         prefix=f"{DB_PATH.stem}_",
@@ -162,6 +163,11 @@ def regenerate_database():
     temp_path = Path(temp_file.name)
     temp_file.close()
 
+    selected_brands = set(brand_names or [])
+    is_partial_refresh = bool(selected_brands) and DB_PATH.exists()
+    if is_partial_refresh:
+        shutil.copy2(DB_PATH, temp_path)
+
     conn = _connect(temp_path)
     _create_schema(conn)
     c = conn.cursor()
@@ -171,12 +177,18 @@ def regenerate_database():
 
     try:
         with APIClient(config.get_cookies()) as client:
-            brand_items = list(config.BRAND_CODES.items())
+            brand_items = [
+                item for item in config.BRAND_CODES.items()
+                if not selected_brands or item[0] in selected_brands
+            ]
+            if not brand_items:
+                raise ValueError("No valid brands were selected for refresh")
             engine_issue_count = 0
             skipped_brands = []
-            model_count = 0
-            version_count = 0
-            engine_count = 0
+            successful_brands = 0
+            model_count = c.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+            version_count = c.execute("SELECT COUNT(*) FROM versions").fetchone()[0]
+            engine_count = c.execute("SELECT COUNT(*) FROM engines").fetchone()[0]
 
             for idx, (brand_name, brand_code) in enumerate(brand_items):
                 counts_before_brand = (model_count, version_count, engine_count, engine_issue_count)
@@ -216,15 +228,29 @@ def regenerate_database():
                     for model in models:
                         api_model_name = parser.get_model_name(model)
                         model_name = config.get_model_display_name(brand_code, api_model_name)
-                        
-                        c.execute(
-                            "INSERT INTO models (brand_id, model_name, api_model_name) VALUES (?, ?, ?)",
-                            (brand_id, model_name, api_model_name)
-                        )
-                        model_count += 1
-                        
-                        c.execute("SELECT last_insert_rowid()")
-                        model_id = c.fetchone()[0]
+
+                        model_id = None
+                        if is_partial_refresh:
+                            c.execute(
+                                "SELECT model_id FROM models WHERE brand_id=? AND "
+                                "(api_model_name=? OR (api_model_name IS NULL AND model_name=?)) LIMIT 1",
+                                (brand_id, api_model_name, model_name),
+                            )
+                            existing_model = c.fetchone()
+                            if existing_model:
+                                model_id = existing_model[0]
+                                c.execute(
+                                    "UPDATE models SET model_name=?, api_model_name=? WHERE model_id=?",
+                                    (model_name, api_model_name, model_id),
+                                )
+
+                        if model_id is None:
+                            c.execute(
+                                "INSERT INTO models (brand_id, model_name, api_model_name) VALUES (?, ?, ?)",
+                                (brand_id, model_name, api_model_name)
+                            )
+                            model_id = c.lastrowid
+                            model_count += 1
                         
                         versions = parser.extract_versions(model)
                         for version in versions:
@@ -235,15 +261,26 @@ def regenerate_database():
                                 api_model_name,
                                 api_version_name
                             )
-                            
+
+                            if is_partial_refresh:
+                                c.execute(
+                                    "SELECT version_id FROM versions WHERE model_id=? AND version_id_api=? LIMIT 1",
+                                    (model_id, version_id_api),
+                                )
+                                existing_version = c.fetchone()
+                                if existing_version:
+                                    c.execute(
+                                        "UPDATE versions SET version_name=? WHERE version_id=?",
+                                        (version_name, existing_version[0]),
+                                    )
+                                    continue
+
                             c.execute(
                                 "INSERT INTO versions (model_id, version_name, version_id_api) VALUES (?, ?, ?)",
                                 (model_id, version_name, version_id_api)
                             )
                             version_count += 1
-                            
-                            c.execute("SELECT last_insert_rowid()")
-                            version_id = c.fetchone()[0]
+                            version_id = c.lastrowid
                             
                             # Get engines
                             try:
@@ -279,6 +316,7 @@ def regenerate_database():
                                 engine_count += 1
                     c.execute("RELEASE SAVEPOINT current_brand")
                     conn.commit()
+                    successful_brands += 1
                 
                 except Exception as e:
                     model_count, version_count, engine_count, engine_issue_count = counts_before_brand
@@ -295,6 +333,14 @@ def regenerate_database():
                         temp_path.unlink(missing_ok=True)
                         return False, "Cookies expired! Please update them in Settings."
                     skipped_brands.append(f"{brand_name}: {e}")
+
+            if is_partial_refresh and successful_brands != len(brand_items):
+                progress_bar.empty()
+                status_text.empty()
+                conn.close()
+                temp_path.unlink(missing_ok=True)
+                reason = "; ".join(skipped_brands[:3]) or "No data returned from API"
+                return False, f"Selected brand was not updated; the existing database is unchanged. {reason}"
 
             if model_count == 0 or version_count == 0:
                 progress_bar.empty()
@@ -372,11 +418,16 @@ def search_models_and_engines(query):
     conn = _connect()
     c = conn.cursor()
     
+    terms = [term for term in str(query).split() if term]
+    if not terms:
+        conn.close()
+        return {'models': [], 'engines': []}
     query_pattern = f"%{query}%"
     
     # Search models and version-level names. A website "model" may be stored as
     # a version under a broader API model, e.g. C3 PICASSO under C3.
-    c.execute("""
+    if len(terms) == 1:
+        c.execute("""
         SELECT DISTINCT
             CASE
                 WHEN v.version_name LIKE ? AND v.version_name <> m.model_name THEN v.version_name
@@ -394,7 +445,22 @@ def search_models_and_engines(query):
            OR COALESCE(v.version_name, '') LIKE ?
         ORDER BY label
         LIMIT 50
-    """, (query_pattern, query_pattern, query_pattern, query_pattern, query_pattern))
+        """, (query_pattern, query_pattern, query_pattern, query_pattern, query_pattern))
+    else:
+        searchable = "COALESCE(b.brand_name, '') || ' ' || COALESCE(m.model_name, '') || ' ' || COALESCE(m.api_model_name, '') || ' ' || COALESCE(v.version_name, '')"
+        conditions = " AND ".join(f"({searchable}) LIKE ?" for _ in terms)
+        c.execute(f"""
+            SELECT DISTINCT
+                m.model_name || ' (' || COALESCE(v.version_name, 'Unknown') || ')' AS label,
+                m.model_name,
+                v.version_name
+            FROM models m
+            JOIN brands b ON b.brand_id = m.brand_id
+            LEFT JOIN versions v ON v.model_id = m.model_id
+            WHERE {conditions}
+            ORDER BY label
+            LIMIT 50
+        """, tuple(f"%{term}%" for term in terms))
     
     models = [
         {'label': row[0], 'model': row[1], 'version': row[2]}
@@ -402,17 +468,19 @@ def search_models_and_engines(query):
     ]
     
     # Search engines
-    c.execute("""
+    engine_searchable = "COALESCE(e.engine_name, '') || ' ' || COALESCE(e.engine_code, '') || ' ' || COALESCE(m.model_name, '') || ' ' || COALESCE(v.version_name, '') || ' ' || COALESCE(b.brand_name, '')"
+    engine_conditions = " AND ".join(f"({engine_searchable}) LIKE ?" for _ in terms)
+    c.execute(f"""
         SELECT DISTINCT e.engine_name, COALESCE(e.engine_code, ''), m.model_name, b.brand_name
         FROM engines e
         JOIN versions v ON e.version_id = v.version_id
         JOIN models m ON v.model_id = m.model_id
         JOIN brands b ON m.brand_id = b.brand_id
-        WHERE (e.engine_name LIKE ? OR COALESCE(e.engine_code, '') LIKE ?)
+        WHERE {engine_conditions}
           AND COALESCE(e.engine_status, 'OK') = 'OK'
         ORDER BY COALESCE(e.engine_code, ''), e.engine_name
         LIMIT 50
-    """, (query_pattern, query_pattern))
+    """, tuple(f"%{term}%" for term in terms))
     
     engines = [
         {'engine': row[0], 'engine_code': row[1], 'model': row[2], 'brand': row[3]}

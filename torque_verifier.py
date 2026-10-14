@@ -533,11 +533,130 @@ def _text_score(needle: str, haystack: str) -> float:
     return max(ratio, overlap)
 
 
+DESCRIPTION_CONNECTORS = {
+    "a", "an", "and", "at", "by", "for", "from", "in", "into", "of",
+    "on", "or", "the", "to", "with",
+}
+
+
+def _description_token_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if len(left) > 3 and len(right) > 3:
+        def singular(token: str) -> str:
+            if token.endswith("ies") and len(token) > 4:
+                return token[:-3] + "y"
+            if token.endswith("s") and not token.endswith("ss") and len(token) > 4:
+                return token[:-1]
+            return token
+
+        if singular(left) == singular(right):
+            return 1.0
+    ratio = SequenceMatcher(None, left, right).ratio()
+    return ratio if ratio >= 0.82 else 0.0
+
+
+def _description_text_score(needle: str, haystack: str) -> float:
+    """Compare informative description terms in both directions."""
+    query_terms = [
+        term for term in _match_key(needle).split()
+        if term not in DESCRIPTION_CONNECTORS
+    ]
+    found_terms = [
+        term for term in _match_key(haystack).split()
+        if term not in DESCRIPTION_CONNECTORS
+    ]
+    if not query_terms or not found_terms:
+        return 0.0
+
+    pairs = [
+        (_description_token_similarity(query, found), query_index, found_index)
+        for query_index, query in enumerate(query_terms)
+        for found_index, found in enumerate(found_terms)
+        if _description_token_similarity(query, found) > 0
+    ]
+    pairs.sort(reverse=True)
+    used_query = set()
+    used_found = set()
+    matched_weight = 0.0
+    for similarity, query_index, found_index in pairs:
+        if query_index in used_query or found_index in used_found:
+            continue
+        used_query.add(query_index)
+        used_found.add(found_index)
+        matched_weight += similarity
+
+    precision = matched_weight / len(found_terms)
+    recall = matched_weight / len(query_terms)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
 def _description_score(needle: str, haystack: str) -> Dict[str, Any]:
     scored = []
-    for variant in _description_variants(needle):
+    variants = _description_variants(needle)
+
+    # Match uppercase initialisms against consecutive candidate words, so an
+    # abbreviation such as UCA can resolve to "Upper Control Arm" from context.
+    acronyms = {
+        token.lower(): token
+        for token in re.findall(r"\b[A-Z][A-Z0-9]{2,}\b", needle)
+    }
+    candidate_words = _match_key(haystack).split()
+    contextual_phrases = {}
+    for acronym, display in acronyms.items():
+        if acronym in candidate_words:
+            continue
+        phrases = set()
+        for start in range(len(candidate_words)):
+            end = start + len(acronym)
+            words = candidate_words[start:end]
+            if len(words) == len(acronym) and "".join(word[0] for word in words) == acronym:
+                phrases.add(" ".join(words))
+        if phrases:
+            contextual_phrases[acronym] = (display, sorted(phrases))
+
+    if contextual_phrases:
+        contextual_variants = []
+        for variant in variants:
+            pending = [(variant["text"].split(), list(variant["expansions"]))]
+            for acronym, (display, phrases) in contextual_phrases.items():
+                expanded = []
+                for words, expansions in pending:
+                    positions = [i for i, word in enumerate(words) if word == acronym]
+                    if not positions:
+                        expanded.append((words, expansions))
+                        continue
+                    for index in positions:
+                        for phrase in phrases:
+                            expanded.append((
+                                words[:index] + phrase.split() + words[index + 1:],
+                                expansions + [{
+                                    "shortcut": display,
+                                    "meaning": phrase,
+                                    "ambiguous": len(phrases) > 1,
+                                    "category": "acronym",
+                                }],
+                            ))
+                pending = expanded[:MAX_DESCRIPTION_VARIANTS]
+            contextual_variants.extend(
+                {"text": " ".join(words), "expansions": expansions}
+                for words, expansions in pending
+            )
+        variants.extend(contextual_variants)
+
+    seen_variants = set()
+    for variant in variants:
+        marker = (
+            variant["text"],
+            tuple((item["shortcut"], item["meaning"]) for item in variant["expansions"]),
+        )
+        if marker in seen_variants:
+            continue
+        seen_variants.add(marker)
         item = variant.copy()
-        item["score"] = _text_score(variant["text"], haystack)
+        item["score"] = _description_text_score(variant["text"], haystack)
         if (
             item["score"] < MODULE_EXPANSION_MIN_SCORE
             and any(expansion.get("category") == "module" for expansion in item["expansions"])
@@ -724,6 +843,61 @@ def _torque_match(target: str, found: str) -> bool:
 
     target_key = _match_key(target)
     return bool(target_key and target_key in _match_key(found))
+
+
+def _torque_similarity_score(target: str, found: str) -> float:
+    """Score numeric torque proximity without rewarding shared unit text."""
+    if _torque_match(target, found):
+        return 1.0
+
+    target_spec = _parse_torque_specification(target)
+    found_spec = _parse_torque_specification(found)
+    if target_spec["has_unparsed_numeric_content"] or found_spec["has_unparsed_numeric_content"]:
+        return 0.0
+
+    def proximity(left: float, right: float) -> float:
+        if left == 0:
+            return 1.0 if right == 0 else 0.0
+        return max(0.0, 1.0 - abs(left - right) / abs(left))
+
+    target_stages = target_spec["stages"]
+    found_stages = found_spec["stages"]
+    if target_stages or found_stages:
+        if target_stages and found_stages and len(target_stages) == len(found_stages):
+            scores = []
+            for target_stage, found_stage in zip(target_stages, found_stages):
+                if target_stage["type"] != found_stage["type"]:
+                    return 0.0
+                if target_stage["type"] == "angle":
+                    scores.append(proximity(target_stage["value"], found_stage["value"]))
+                    continue
+                target_values = target_stage["values_nm"]
+                found_values = found_stage["values_nm"]
+                if len(target_values) != len(found_values):
+                    return 0.0
+                scores.extend(proximity(left, right) for left, right in zip(target_values, found_values))
+            return sum(scores) / len(scores) if scores else 0.0
+
+        # Preserve the existing raw-number behavior for bare targets such as "30".
+        if (
+            target_spec["bare_numeric_only"]
+            and len(target_spec["bare_numbers"]) == 1
+            and len(found_stages) == 1
+            and found_stages[0]["type"] == "torque"
+            and len(found_stages[0]["values"]) == 1
+        ):
+            return proximity(target_spec["bare_numbers"][0], found_stages[0]["values"][0])
+        return 0.0
+
+    target_numbers = target_spec["bare_numbers"]
+    found_numbers = found_spec["bare_numbers"]
+    if target_numbers or found_numbers:
+        if len(target_numbers) != len(found_numbers):
+            return 0.0
+        scores = [proximity(left, right) for left, right in zip(target_numbers, found_numbers)]
+        return sum(scores) / len(scores) if scores else 0.0
+
+    return _text_score(target, found)
 
 
 def _find_vehicle_versions(model_year: int, vehicle_family: str) -> List[Dict[str, Any]]:
@@ -1342,7 +1516,7 @@ def _score_torque_row(
     )
     description_score = description_result["score"]
     torque_matches = _torque_match(target_torque, row["specification"])
-    torque_score = 1.0 if torque_matches else _text_score(target_torque, row["specification"])
+    torque_score = _torque_similarity_score(target_torque, row["specification"])
     vsc_score = float(leaf.get("vsc_score", 0.0))
 
     if description.strip():

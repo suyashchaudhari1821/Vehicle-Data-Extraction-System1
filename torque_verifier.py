@@ -664,7 +664,7 @@ def _description_score(needle: str, haystack: str) -> Dict[str, Any]:
             continue
         scored.append(item)
 
-    return max(
+    best = max(
         scored,
         key=lambda item: (
             item["score"],
@@ -673,6 +673,22 @@ def _description_score(needle: str, haystack: str) -> Dict[str, Any]:
         ),
         default={"text": _match_key(needle), "expansions": [], "score": 0.0},
     )
+
+    # Do not let a shared generic word (for example, "body") make an
+    # unresolved uppercase shortcut look like a strong description match.
+    unresolved_acronyms = [
+        acronym
+        for acronym in acronyms
+        if acronym not in candidate_words
+        and not any(
+            item["shortcut"].lower() == acronym
+            for item in best["expansions"]
+        )
+    ]
+    if unresolved_acronyms:
+        best = best.copy()
+        best["score"] = min(best["score"], 0.25)
+    return best
 
 
 def _normalized_specification(value: Any) -> str:

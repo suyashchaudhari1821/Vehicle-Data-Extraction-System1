@@ -150,6 +150,175 @@ def get_database_summary():
     return summary
 
 
+def check_database_updates():
+    """Compare live model/version/engine data with SQLite without changing it."""
+    if not DB_PATH.exists():
+        return {"ok": False, "message": "The local database does not exist yet."}
+
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT b.brand_name, b.brand_code, m.model_name, m.api_model_name,
+                   v.version_name, v.version_id_api, e.engine_name, e.engine_code
+            FROM brands b
+            JOIN models m ON m.brand_id = b.brand_id
+            LEFT JOIN versions v ON v.model_id = m.model_id
+            LEFT JOIN engines e ON e.version_id = v.version_id
+        """).fetchall()
+        refresh_row = conn.execute(
+            "SELECT value FROM metadata WHERE key='last_refresh'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    # Index the stored snapshot by source identifiers so display aliases do not
+    # make an existing API model look new.
+    snapshot = {}
+    for brand, brand_code, model, api_model, version, version_api_id, engine, code in rows:
+        model_key = (brand_code or brand or "").strip().casefold(), (api_model or model or "").strip().casefold()
+        model_entry = snapshot.setdefault(model_key, {"brand": brand, "model": model, "versions": {}})
+        if version is None:
+            continue
+        version_key = str(version_api_id).strip() if version_api_id else str(version).strip().casefold()
+        version_entry = model_entry["versions"].setdefault(
+            version_key,
+            {"name": version, "engines": set()},
+        )
+        if engine and engine != "N/A":
+            version_entry["engines"].add((str(engine).strip().casefold(), str(code or "").strip().casefold()))
+
+    changes = []
+    errors = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    brand_items = list(config.BRAND_CODES.items())
+    total_existing_versions = sum(len(model["versions"]) for model in snapshot.values())
+    estimated_requests = max(1, len(brand_items) + total_existing_versions)
+    completed_requests = 0
+
+    def update_progress(label):
+        nonlocal completed_requests
+        completed_requests += 1
+        progress_bar.progress(min(0.99, completed_requests / estimated_requests))
+        status_text.text(label)
+
+    try:
+        with APIClient(config.get_cookies()) as client:
+            for brand_name, brand_code in brand_items:
+                try:
+                    response = client.get(
+                        config.MODELS_ENDPOINT,
+                        params=config.get_model_request_params(brand_code),
+                    )
+                    models = parser.extract_models(response)
+                    update_progress(f"Checking {brand_name} models…")
+                    if not models:
+                        errors.append(f"{brand_name}: API returned no parsable models")
+                        continue
+
+                    for model in models:
+                        api_model_name = parser.get_model_name(model)
+                        display_name = config.get_model_display_name(brand_code, api_model_name)
+                        model_key = brand_code.strip().casefold(), api_model_name.strip().casefold()
+                        stored_model = snapshot.get(model_key)
+                        if stored_model is None:
+                            changes.append({
+                                "Type": "New model",
+                                "Brand": brand_name,
+                                "Model": display_name,
+                                "Version": "",
+                                "Engine": "",
+                                "Engine code": "",
+                            })
+
+                        versions = parser.extract_versions(model)
+                        for version in versions:
+                            version_api_id = parser.get_version_id(version)
+                            source_version_name = parser.get_version_name(version)
+                            version_name = config.get_version_display_name(
+                                brand_code, api_model_name, source_version_name
+                            )
+                            version_key = (
+                                str(version_api_id).strip()
+                                if version_api_id
+                                else str(version_name).strip().casefold()
+                            )
+                            stored_version = (stored_model or {}).get("versions", {}).get(version_key)
+                            if stored_version is None:
+                                changes.append({
+                                    "Type": "New version",
+                                    "Brand": brand_name,
+                                    "Model": display_name,
+                                    "Version": version_name,
+                                    "Engine": "",
+                                    "Engine code": "",
+                                })
+                            elif stored_version["name"] != version_name:
+                                changes.append({
+                                    "Type": "Version renamed",
+                                    "Brand": brand_name,
+                                    "Model": display_name,
+                                    "Version": f"{stored_version['name']} → {version_name}",
+                                    "Engine": "",
+                                    "Engine code": "",
+                                })
+
+                            if not version_api_id:
+                                errors.append(f"{brand_name} / {display_name} / {version_name}: missing version ID")
+                                continue
+                            try:
+                                engine_response = client.get(
+                                    config.ENGINES_ENDPOINT,
+                                    params={"modelVersionId": version_api_id},
+                                )
+                                engines = parser.extract_engines(engine_response)
+                                update_progress(f"Checking {brand_name}: {display_name} / {version_name}")
+                            except Exception as exc:
+                                errors.append(f"{brand_name} / {display_name} / {version_name}: {exc}")
+                                continue
+
+                            old_engines = (stored_version or {}).get("engines", set())
+                            live_engines = set()
+                            for engine in engines:
+                                engine_name = engine["name"]
+                                engine_code = engine.get("code", "")
+                                engine_key = (engine_name.strip().casefold(), engine_code.strip().casefold())
+                                live_engines.add(engine_key)
+                                if engine_key not in old_engines:
+                                    changes.append({
+                                        "Type": "New engine",
+                                        "Brand": brand_name,
+                                        "Model": display_name,
+                                        "Version": version_name,
+                                        "Engine": engine_name,
+                                        "Engine code": engine_code,
+                                    })
+                            for old_name, old_code in sorted(old_engines - live_engines):
+                                changes.append({
+                                    "Type": "Engine no longer returned",
+                                    "Brand": brand_name,
+                                    "Model": display_name,
+                                    "Version": version_name,
+                                    "Engine": old_name,
+                                    "Engine code": old_code,
+                                })
+                except Exception as exc:
+                    errors.append(f"{brand_name}: {exc}")
+                    update_progress(f"{brand_name} check failed")
+    finally:
+        progress_bar.empty()
+        status_text.empty()
+
+    return {
+        "ok": not errors,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "database_last_refresh": refresh_row[0] if refresh_row else "Never",
+        "changes": changes,
+        "errors": errors,
+        "message": "Comparison complete." if not errors else "Comparison finished with incomplete API results.",
+    }
+
+
 def regenerate_database():
     """Refresh every configured brand and atomically replace the database."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)

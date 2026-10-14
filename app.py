@@ -278,6 +278,34 @@ with st.sidebar:
                 use_container_width=True,
                 help="Optional backup copy of the SQLite database currently loaded by the app.",
             )
+            if st.button(
+                "Check for Model / Engine Updates",
+                use_container_width=True,
+                help="Compare current API models, versions, and engines with the local database.",
+            ):
+                if not cookies_valid:
+                    st.error("Update the API credentials above before checking for updates.")
+                else:
+                    with st.spinner("Comparing live API data with the database. This may take several minutes..."):
+                        st.session_state.database_update_check = database.check_database_updates()
+
+            update_check = st.session_state.get("database_update_check")
+            if update_check:
+                st.caption(
+                    f"Checked: {format_refresh_time(update_check.get('checked_at'))} · "
+                    f"Database refreshed: {format_refresh_time(update_check.get('database_last_refresh'))}"
+                )
+                changes = update_check.get("changes", [])
+                if changes:
+                    st.markdown(f"**Detected changes ({len(changes)}):**")
+                    st.dataframe(pd.DataFrame(changes), use_container_width=True, hide_index=True)
+                elif update_check.get("ok"):
+                    st.success("No model, version, or engine differences found.")
+                if update_check.get("errors"):
+                    st.warning(update_check.get("message", "Some API results could not be checked."))
+                    with st.expander(f"Details for {len(update_check['errors'])} incomplete checks"):
+                        for error in update_check["errors"]:
+                            st.write(f"- {error}")
             if db_sync.is_configured():
                 if st.button(
                     "Save Current Database to GitHub",

@@ -1520,7 +1520,9 @@ def _score_torque_row(
     vsc_score = float(leaf.get("vsc_score", 0.0))
 
     if description.strip():
-        score = (0.58 * description_score) + (0.30 * torque_score) + (0.12 * vsc_score)
+        # The requested joint is the primary retrieval signal; torque proximity
+        # should refine similarly relevant descriptions, not outrank them.
+        score = (0.75 * description_score) + (0.15 * torque_score) + (0.10 * vsc_score)
     else:
         score = (0.78 * torque_score) + (0.22 * vsc_score)
 

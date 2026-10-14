@@ -1606,7 +1606,7 @@ def verify_torque(
         }
 
     ranked_candidates = sorted(all_candidates, key=lambda row: row["score"], reverse=True)
-    candidates = ranked_candidates[:5]
+    candidates = ranked_candidates[:10]
     best = candidates[0] if candidates else None
     if not best:
         incomplete = unreadable_pages > 0

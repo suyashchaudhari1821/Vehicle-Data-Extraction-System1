@@ -926,22 +926,40 @@ if torque_submitted:
                 st.markdown(f"**Found description:** {best['description']}")
                 st.markdown(f"**Found specification:** {best['specification']}")
                 st.markdown(f"**Similarity:** {best['confidence']}%")
+                if best.get("matched_description_input"):
+                    st.caption(f"Description interpreted as: {best['matched_description_input']}")
+                best_expansions = best.get("shortcut_expansions", [])
+                if best_expansions:
+                    expansion_text = "; ".join(
+                        f"{item.get('shortcut', '')} → {item.get('meaning', '')}"
+                        + (" (ambiguous)" if item.get("ambiguous") else "")
+                        for item in best_expansions
+                    )
+                    st.caption(f"Shortcut meanings: {expansion_text}")
                 if best.get("comment"):
                     st.markdown(f"**Comment:** {best['comment']}")
 
                 candidates = verification.get("candidates", [])
                 if candidates:
-                    st.markdown("#### Best Matches")
+                    st.markdown(f"#### Best Matches ({len(candidates)})")
                     candidate_rows = []
                     for candidate in candidates:
                         candidate_engine = candidate.get("engine", {})
                         candidate_vehicle = candidate.get("vehicle", {})
+                        shortcut_expansions = candidate.get("shortcut_expansions", [])
+                        shortcut_text = "; ".join(
+                            f"{item.get('shortcut', '')} → {item.get('meaning', '')}"
+                            + (" (ambiguous)" if item.get("ambiguous") else "")
+                            for item in shortcut_expansions
+                        )
                         candidate_rows.append(
                             {
                                 "Similarity": f"{candidate['confidence']}%",
                                 "Description Similarity": f"{round(candidate['description_score'] * 100, 1)}%",
                                 "Torque Similarity": f"{round(candidate['torque_score'] * 100, 1)}%",
                                 "Torque Match": "Yes" if candidate["torque_match"] else "No",
+                                "Description interpreted as": candidate.get("matched_description_input", ""),
+                                "Shortcut meanings": shortcut_text,
                                 "Actual Description": candidate["description"],
                                 "Actual Torque": candidate["specification"],
                                 "Comment": candidate.get("comment", ""),
